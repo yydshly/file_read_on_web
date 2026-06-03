@@ -5,3 +5,6 @@ search_index.json.tmp
 config.json
 annotations.json
 cache/
+build/
+dist/
+*.spec

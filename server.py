@@ -23,8 +23,21 @@ import annotations as annotations_mod
 import converter
 import search as search_mod
 
-BASE_DIR = Path(__file__).parent.resolve()
-STATIC_DIR = BASE_DIR / "static"
+def _app_base_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent.resolve()
+    return Path(__file__).parent.resolve()
+
+
+def _resource_base_dir() -> Path:
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS).resolve()
+    return Path(__file__).parent.resolve()
+
+
+BASE_DIR = _app_base_dir()
+RESOURCE_DIR = _resource_base_dir()
+STATIC_DIR = RESOURCE_DIR / "static"
 CACHE_DIR = BASE_DIR / "cache"
 CONFIG_PATH = BASE_DIR / "config.json"
 ANNO_PATH = BASE_DIR / "annotations.json"
