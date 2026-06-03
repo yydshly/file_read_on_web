@@ -1,0 +1,5 @@
+fastapi>=0.110
+uvicorn>=0.29
+markdown>=3.6
+pygments>=2.17
+pypdf>=4.0

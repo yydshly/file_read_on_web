@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>资料浏览器</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <div class="sidebar-head">
+      <div class="row">
+        <strong>资料浏览器</strong>
+        <button id="pick-root" type="button" title="切换根目录">📁 切换</button>
+      </div>
+      <div id="root-path" class="root-path" title=""></div>
+      <input id="filter" type="search" placeholder="筛选文件名…">
+      <input id="search-content" type="search" placeholder="🔍 搜文档内容（回车）">
+      <div class="view-tabs">
+        <button class="vt active" data-view="all" type="button">全部</button>
+        <button class="vt" data-view="starred" type="button">★ 收藏</button>
+        <button class="vt" data-view="tagged" type="button">🏷 已标</button>
+      </div>
+    </div>
+    <div id="tree" class="tree">加载中…</div>
+    <div id="search-results" class="search-results" hidden></div>
+  </aside>
+  <div id="resizer" class="resizer" title="拖动调节宽度"></div>
+  <main id="main">
+    <header id="bar">
+      <div id="crumb">请选择左侧的文件</div>
+      <div class="actions">
+        <button id="star" type="button" title="收藏 (S)" style="display:none">☆</button>
+        <button id="tag-btn" type="button" title="标签 (T)" style="display:none">🏷<span id="tag-count" class="count-badge"></span></button>
+        <button id="note-btn" type="button" title="笔记 (N)" style="display:none">📝<span id="note-dot" class="dot"></span></button>
+        <button id="reveal" type="button" title="在资源管理器中打开" style="display:none">📂</button>
+        <a id="dl" href="#" target="_blank" rel="noopener" title="下载原文件" style="display:none">⬇</a>
+      </div>
+    </header>
+
+    <div id="tag-popover" class="popover" hidden>
+      <div class="popover-head">标签</div>
+      <div id="tag-chips" class="tag-chips"></div>
+      <button id="add-tag" type="button" class="link" title="添加自定义标签">+ 新标签</button>
+    </div>
+
+    <div id="ctx-menu" class="ctx-menu" hidden></div>
+
+    <div id="note-popover" class="popover note-popover" hidden>
+      <div class="popover-head">笔记 <span id="note-hint" class="hint"></span></div>
+      <textarea id="notes" placeholder="给这个文件加点笔记…自动保存"></textarea>
+    </div>
+    <section id="viewer">
+      <div class="placeholder">点击左侧文件以预览</div>
+    </section>
+    <div id="preconvert" class="preconvert" style="display:none"></div>
+  </main>
+</div>
+<script src="/static/app.js"></script>
+</body>
+</html>
