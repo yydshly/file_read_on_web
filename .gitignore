@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+search_index.json
+search_index.json.tmp
+config.json
+annotations.json
+cache/

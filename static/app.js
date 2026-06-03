@@ -85,7 +85,7 @@ function scheduleSaveOpenDirs() {
 
 async function loadTree() {
   treeEl.innerHTML = '加载中…';
-  const r = await fetch('/api/tree?recursive=0');
+  const r = await fetch('/api/tree?recursive=1');
   const data = await r.json();
   pathToLi = new Map();
   pathToDirLi = new Map();
@@ -128,7 +128,7 @@ function renderNodes(nodes, openSet) {
       li.dataset.dirPath = n.path;
       pathToDirLi.set(n.path, li);
       const sub = renderNodes(n.children || [], openSet);
-      li.dataset.loaded = n.children && n.children.length ? '1' : '0';
+      li.dataset.loaded = Array.isArray(n.children) ? '1' : '0';
       const isOpen = li.dataset.loaded === '1' && openSet && openSet.has(n.path);
       sub.style.display = isOpen ? '' : 'none';
       if (isOpen) li.classList.add('open');

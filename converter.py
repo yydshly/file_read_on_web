@@ -7,6 +7,7 @@ import os
 import posixpath
 import re
 import shutil
+import sys
 import tempfile
 import time
 import uuid
@@ -22,25 +23,73 @@ IMAGE_EXTS = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
 TEXT_EXTS = {".txt", ".log", ".csv"}
 
 
+def _app_base_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent.resolve()
+    return Path(__file__).parent.resolve()
+
+
+def _soffice_from_home(home: str | os.PathLike) -> Optional[str]:
+    base = Path(home).expanduser()
+    candidates = [
+        base / "program" / "soffice.exe",
+        base / "program" / "soffice",
+        base / "Contents" / "MacOS" / "soffice",
+        base / "soffice.exe",
+        base / "soffice",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
 def find_soffice() -> Optional[str]:
     """Locate the LibreOffice executable."""
     env = os.environ.get("SOFFICE_PATH")
-    if env and os.path.exists(env):
-        return env
+    if env:
+        p = Path(env).expanduser()
+        if p.exists():
+            return str(p)
+
+    home = os.environ.get("LIBREOFFICE_HOME")
+    if home:
+        found = _soffice_from_home(home)
+        if found:
+            return found
+
+    base_dir = _app_base_dir()
+    bundled_homes = [
+        base_dir / "libreoffice",
+        base_dir / "LibreOffice",
+    ]
+    for bundled_home in bundled_homes:
+        found = _soffice_from_home(bundled_home)
+        if found:
+            return found
+
     in_path = shutil.which("soffice") or shutil.which("soffice.exe")
     if in_path:
         return in_path
-    candidates = [
-        r"D:\software\LibreOffice\program\soffice.exe",
-        r"C:\Program Files\LibreOffice\program\soffice.exe",
-        r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+
+    homes = [
+        r"D:\software\LibreOffice",
+        r"C:\Program Files\LibreOffice",
+        r"C:\Program Files (x86)\LibreOffice",
+        "/Applications/LibreOffice.app",
+    ]
+    for candidate_home in homes:
+        found = _soffice_from_home(candidate_home)
+        if found:
+            return found
+
+    direct_candidates = [
         "/usr/bin/soffice",
         "/usr/local/bin/soffice",
-        "/Applications/LibreOffice.app/Contents/MacOS/soffice",
     ]
-    for c in candidates:
-        if os.path.exists(c):
-            return c
+    for candidate in direct_candidates:
+        if os.path.exists(candidate):
+            return candidate
     return None
 
 
@@ -152,6 +201,10 @@ async def office_to_pdf(src: Path, cache_dir: Path,
                 stdout_b, stderr_b = await asyncio.wait_for(
                     proc.communicate(), timeout=180
                 )
+            except asyncio.CancelledError:
+                proc.kill()
+                await proc.wait()
+                raise
             except asyncio.TimeoutError:
                 proc.kill()
                 await proc.wait()

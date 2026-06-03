@@ -215,6 +215,8 @@ def _start_preconvert():
 _prebuild_task: Optional[asyncio.Task] = None
 _prebuild_root: Optional[Path] = None
 _background_root: Optional[Path] = None
+_warm_task: Optional[asyncio.Task] = None
+_search_index_loaded_root: Optional[Path] = None
 
 
 async def _prebuild_worker(root: Path):
@@ -256,31 +258,75 @@ def _start_prebuild():
 
 
 def _stop_background_tasks():
-    global _prebuild_root, _background_root
+    global _prebuild_root, _background_root, _search_index_loaded_root
     _prebuild_root = None
     _background_root = None
+    _search_index_loaded_root = None
     if _preconvert_task and not _preconvert_task.done():
         _preconvert_task.cancel()
     if _prebuild_task and not _prebuild_task.done():
         _prebuild_task.cancel()
+    if _warm_task and not _warm_task.done():
+        _warm_task.cancel()
 
 
-async def _start_background_after_tree(root: Path):
+def _warm_office_candidates(root: Path, limit: int = 2) -> list[Path]:
+    files: list[Path] = []
+    last = _get_last_file(root)
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in _SKIP_NAMES]
+        for name in sorted(filenames, key=str.lower):
+            if name.startswith("."):
+                continue
+            p = Path(dirpath) / name
+            if p.suffix.lower() in converter.OFFICE_EXTS:
+                files.append(p)
+    if last:
+        last_path = (root / last).resolve()
+        for i, p in enumerate(files):
+            if p.resolve() == last_path:
+                return files[i + 1:i + 1 + limit]
+    return files[:limit]
+
+
+async def _warm_office_after_tree(root: Path):
+    await asyncio.sleep(1.0)
+    if ROOT != root:
+        return
+    for p in _warm_office_candidates(root, limit=2):
+        if ROOT != root:
+            return
+        try:
+            await converter.office_to_pdf(p, CACHE_DIR)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[prewarm] skip {p.name}: {e}")
+
+
+def _start_warm_after_tree(root: Path):
     global _background_root
     if _background_root == root:
         return
     _background_root = root
-    await asyncio.sleep(0.5)
-    if ROOT != root or _background_root != root:
-        return
-    loop = asyncio.get_running_loop()
-    loaded = await loop.run_in_executor(None, search_mod.load_index, SEARCH_INDEX_PATH)
-    if loaded:
-        print(f"[search] loaded {loaded} indexed files from disk")
-    if ROOT != root or _background_root != root:
-        return
-    _start_preconvert()
-    _start_prebuild()
+    global _warm_task
+    if _warm_task and not _warm_task.done():
+        _warm_task.cancel()
+    _warm_task = asyncio.create_task(_warm_office_after_tree(root))
+
+
+def _cancel_warm_task():
+    if _warm_task and not _warm_task.done():
+        _warm_task.cancel()
+
+
+def _ensure_search_index_loaded() -> int:
+    global _search_index_loaded_root
+    if _search_index_loaded_root == ROOT:
+        return 0
+    loaded = search_mod.load_index(SEARCH_INDEX_PATH)
+    _search_index_loaded_root = ROOT
+    return loaded
 
 
 @app.on_event("startup")
@@ -302,14 +348,14 @@ async def _on_shutdown():
 # ---------- routes ----------
 
 @app.get("/api/tree")
-async def api_tree(path: str = "", recursive: int = 0):
+async def api_tree(path: str = "", recursive: int = 1):
     base = ROOT if not path else _safe_resolve(path)
     if not base.is_dir():
         raise HTTPException(400, "path must be a directory")
     loop = asyncio.get_running_loop()
     tree = await loop.run_in_executor(None, _build_tree, base, bool(recursive))
     if not path:
-        asyncio.create_task(_start_background_after_tree(ROOT))
+        _start_warm_after_tree(ROOT)
     return tree
 
 
@@ -336,6 +382,7 @@ async def api_file(path: str = Query(...), remember: int = 1, force: int = 0):
     if kind == "pdf":
         return FileResponse(src, media_type="application/pdf")
     if kind == "office":
+        _cancel_warm_task()
         try:
             pdf = await converter.office_to_pdf(src, CACHE_DIR, force=bool(force))
         except RuntimeError as e:
@@ -385,12 +432,15 @@ def api_cache_stats():
 async def api_search(q: str = Query(...), limit: int = 50):
     """Full-text substring search. CPU-bound — runs in default executor."""
     loop = asyncio.get_running_loop()
+    loaded = await loop.run_in_executor(None, _ensure_search_index_loaded)
     results = await loop.run_in_executor(
         None, search_mod.search, ROOT, CACHE_DIR, q, limit
     )
+    await loop.run_in_executor(None, search_mod.save_index, SEARCH_INDEX_PATH)
     return {"query": q, "count": len(results), "results": results,
             "index": search_mod.index_stats(),
-            "prebuild": search_mod.prebuild_status()}
+            "prebuild": search_mod.prebuild_status(),
+            "loaded": loaded}
 
 
 @app.get("/api/search/status")
