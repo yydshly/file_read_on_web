@@ -103,6 +103,35 @@ def _cache_key(src: Path) -> str:
 _conv_locks: dict[str, asyncio.Lock] = {}
 _conv_locks_guard = asyncio.Lock()
 
+# Live soffice subprocess PIDs (so we can kill orphans on shutdown).
+# Set+GIL is enough for our access pattern (add on spawn, discard on exit).
+_live_soffice_pids: set[int] = set()
+
+
+def kill_orphan_soffice() -> int:
+    """Best-effort: kill any soffice children we spawned that are still alive.
+    Returns the number of processes signalled. Safe to call on shutdown."""
+    killed = 0
+    pids = list(_live_soffice_pids)
+    for pid in pids:
+        try:
+            if os.name == "nt":
+                # On Windows asyncio's Popen.kill calls TerminateProcess
+                import ctypes
+                PROCESS_TERMINATE = 0x0001
+                handle = ctypes.windll.kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+                if handle:
+                    ctypes.windll.kernel32.TerminateProcess(handle, 1)
+                    ctypes.windll.kernel32.CloseHandle(handle)
+                    killed += 1
+            else:
+                os.kill(pid, 15)
+                killed += 1
+        except (OSError, PermissionError):
+            pass
+        _live_soffice_pids.discard(pid)
+    return killed
+
 
 async def _get_lock(key: str) -> asyncio.Lock:
     async with _conv_locks_guard:
@@ -197,20 +226,24 @@ async def office_to_pdf(src: Path, cache_dir: Path,
                 stderr=asyncio.subprocess.PIPE,
                 env=clean_env,
             )
+            _live_soffice_pids.add(proc.pid)
             try:
-                stdout_b, stderr_b = await asyncio.wait_for(
-                    proc.communicate(), timeout=180
-                )
-            except asyncio.CancelledError:
-                proc.kill()
-                await proc.wait()
-                raise
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-                msg = "LibreOffice 转换超时（>180s）"
-                _record_failure(msg)
-                raise RuntimeError(msg)
+                try:
+                    stdout_b, stderr_b = await asyncio.wait_for(
+                        proc.communicate(), timeout=180
+                    )
+                except asyncio.CancelledError:
+                    proc.kill()
+                    await proc.wait()
+                    raise
+                except asyncio.TimeoutError:
+                    proc.kill()
+                    await proc.wait()
+                    msg = "LibreOffice 转换超时（>180s）"
+                    _record_failure(msg)
+                    raise RuntimeError(msg)
+            finally:
+                _live_soffice_pids.discard(proc.pid)
 
             if proc.returncode != 0:
                 stderr = stderr_b.decode("utf-8", errors="ignore")

@@ -24,12 +24,28 @@
     </div>
     <div id="tree" class="tree">加载中…</div>
     <div id="search-results" class="search-results" hidden></div>
+    <div id="cache-footer" class="cache-footer">
+      <button id="cache-footer-btn" type="button" title="点击查看缓存详情">💾 <span id="cache-footer-size">…</span></button>
+    </div>
+    <div id="cache-pop" class="cache-pop" hidden>
+      <div class="cache-pop-head">
+        <strong>缓存使用</strong>
+        <button id="cache-pop-close" type="button" title="关闭">×</button>
+      </div>
+      <table id="cache-pop-table" class="cache-table"></table>
+      <div class="cache-pop-actions">
+        <button id="cache-cleanup-btn" type="button" title="按"年龄 + 大小上限"清理过期/超量项">🧹 智能清理</button>
+        <button id="cache-clear-pdf-btn" type="button" title="完全清空 Office 转换缓存">🗑 清 PDF</button>
+        <button id="cache-clear-tts-btn" type="button" title="完全清空 TTS 音频缓存">🗑 清 TTS</button>
+      </div>
+    </div>
   </aside>
   <div id="resizer" class="resizer" title="拖动调节宽度"></div>
   <main id="main">
     <header id="bar">
       <div id="crumb">请选择左侧的文件</div>
       <div class="actions">
+        <button id="ai-btn" type="button" title="AI 助手 (A)" style="display:none">🤖<span id="ai-dot" class="dot"></span></button>
         <button id="star" type="button" title="收藏 (S)" style="display:none">☆</button>
         <button id="tag-btn" type="button" title="标签 (T)" style="display:none">🏷<span id="tag-count" class="count-badge"></span></button>
         <button id="note-btn" type="button" title="笔记 (N)" style="display:none">📝<span id="note-dot" class="dot"></span></button>
@@ -50,9 +66,32 @@
       <div class="popover-head">笔记 <span id="note-hint" class="hint"></span></div>
       <textarea id="notes" placeholder="给这个文件加点笔记…自动保存"></textarea>
     </div>
-    <section id="viewer">
-      <div class="placeholder">点击左侧文件以预览</div>
-    </section>
+
+    <div class="main-body">
+      <section id="viewer">
+        <div class="placeholder">点击左侧文件以预览</div>
+      </section>
+      <div id="ai-resizer" class="ai-resizer" hidden title="拖动调节 AI 面板宽度"></div>
+      <aside id="ai-panel" class="ai-panel" hidden>
+        <div class="ai-head">
+          <span class="ai-title">🤖 AI 助手</span>
+          <span id="ai-provider" class="hint"></span>
+          <button id="ai-dock-toggle" type="button" title="切换 嵌入侧栏 / 浮层">⇆</button>
+          <button id="ai-close" type="button" title="关闭 (Esc)">×</button>
+        </div>
+        <div id="ai-eligibility" class="ai-eligibility"></div>
+        <div class="ai-toolbar">
+          <button id="ai-summarize" type="button">✨ 整理本文档</button>
+          <button id="ai-tts-last" type="button" title="把最近一条 AI 回复读出来">🔊 朗读</button>
+          <button id="ai-clear" type="button">清空</button>
+        </div>
+        <div id="ai-conv" class="ai-conv"></div>
+        <div class="ai-input-row">
+          <textarea id="ai-input" placeholder="对当前文档提问…（Enter 发送 / Shift+Enter 换行）"></textarea>
+          <button id="ai-send" type="button">发送</button>
+        </div>
+      </aside>
+    </div>
     <div id="preconvert" class="preconvert" style="display:none"></div>
   </main>
 </div>

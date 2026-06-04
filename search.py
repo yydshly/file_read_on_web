@@ -12,12 +12,14 @@ well for Chinese without needing a tokenizer like jieba.
 """
 from __future__ import annotations
 
-import json
+import logging
 import os
 import threading
 import time
 from pathlib import Path
 from typing import Callable, Optional
+
+log = logging.getLogger("search")
 
 try:
     import pypdf  # type: ignore
@@ -30,8 +32,10 @@ _TEXT_EXTS = {".md", ".txt", ".log", ".csv"}
 _PDF_PAGE_CAP = 200                # don't extract beyond this many pages
 _TEXT_LEN_CAP = 2_000_000          # 2MB per file capped
 _PDF_MAX_BYTES = 30 * 1024 * 1024  # skip PDFs larger than 30 MB
+_SCANNED_TEXT_THRESHOLD = 100      # below this many extracted chars -> likely scanned
 _text_cache: dict[str, tuple[float, str]] = {}
-_skipped: dict[str, str] = {}      # abs path -> reason
+_skipped: dict[str, str] = {}      # abs path -> reason (file completely skipped)
+_scanned: set[str] = set()         # abs paths of PDFs detected as scanned (image-only)
 _cache_lock = threading.Lock()
 _SKIP_DIRS = {"__pycache__", "node_modules", ".git", ".idea", ".vscode"}
 
@@ -94,6 +98,12 @@ def _get_text(p: Path, cache_dir: Path) -> str:
         return cached[1]
     text = _extract_text(p, cache_dir)
     _text_cache[abs_key] = (mtime, text)
+    # Track scanned PDFs: those whose pypdf yields almost no text.
+    if p.suffix.lower() == ".pdf" and abs_key not in _skipped:
+        if len(text.strip()) < _SCANNED_TEXT_THRESHOLD:
+            _scanned.add(abs_key)
+        else:
+            _scanned.discard(abs_key)
     return text
 
 
@@ -168,6 +178,7 @@ def index_stats() -> dict:
         "cached_files": len(_text_cache),
         "cached_bytes": sum(len(t) for _, t in _text_cache.values()),
         "skipped": len(_skipped),
+        "scanned": len(_scanned),
     }
 
 
@@ -175,10 +186,36 @@ def skipped_files() -> dict:
     return dict(_skipped)
 
 
+def scanned_files(root: Path | None = None) -> list[str]:
+    """Return paths detected as scanned (image-only) PDFs. If root provided,
+    paths are returned root-relative; otherwise absolute."""
+    out = []
+    for abs_p in _scanned:
+        if root is None:
+            out.append(abs_p)
+        else:
+            try:
+                rel = str(Path(abs_p).relative_to(root)).replace("\\", "/")
+                out.append(rel)
+            except ValueError:
+                continue
+    return out
+
+
+def get_indexed_text(p: Path, cache_dir: Path) -> str:
+    """Public accessor for the cached text of a file (extracts if missing)."""
+    return _get_text(p, cache_dir)
+
+
+def is_scanned(p: Path) -> bool:
+    return str(p.resolve()) in _scanned
+
+
 def clear_cache() -> None:
     with _cache_lock:
         _text_cache.clear()
         _skipped.clear()
+        _scanned.clear()
 
 
 # ---------- background prebuild & disk persistence ----------
@@ -273,6 +310,7 @@ def _clean_utf8_text(text: str) -> str:
 
 def save_index(index_path: Path) -> bool:
     """Persist the text cache to disk. Best-effort; returns success bool."""
+    from safeio import atomic_write_json
     try:
         with _cache_lock:
             payload = {
@@ -284,24 +322,19 @@ def save_index(index_path: Path) -> bool:
                 "skipped": {k: _clean_utf8_text(v) for k, v in _skipped.items()},
                 "saved_at": time.time(),
             }
-        tmp = index_path.with_suffix(index_path.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(index_path)
+        atomic_write_json(index_path, payload)
         return True
     except Exception as e:
-        print(f"[search] save_index failed: {e}")
+        log.warning("save_index failed: %s", e)
         return False
 
 
 def load_index(index_path: Path) -> int:
     """Restore the text cache from disk. Drops entries whose source file has
     changed mtime. Returns number of entries loaded."""
-    if not index_path.exists():
-        return 0
-    try:
-        payload = json.loads(index_path.read_text(encoding="utf-8"))
-    except Exception as e:
-        print(f"[search] load_index failed (will rebuild): {e}")
+    from safeio import read_json
+    payload = read_json(index_path, default=None)
+    if not isinstance(payload, dict):
         return 0
     files = payload.get("files") or {}
     loaded = 0

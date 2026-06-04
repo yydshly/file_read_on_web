@@ -1,0 +1,49 @@
+{
+  "_doc": "User-editable settings. Copy this file to config.json and fill in your keys. The app NEVER writes back to config.json — your last-opened directory and file are tracked separately in state.json. Env-var substitution: \"${MINIMAX_API_KEY}\" reads from os.environ.",
+
+  "ai": {
+    "_doc": "Set 'active' (text provider) and optionally 'tts_provider' (defaults to active if it supports TTS). Remove this whole 'ai' block to disable AI entirely.",
+
+    "active": "minimax_anthropic",
+    "tts_provider": "minimax",
+
+    "providers": {
+      "minimax_anthropic": {
+        "_doc": "Minimax via Anthropic-compatible Messages API. Supports M3 / M2.7 / M2.7-highspeed / M2.5 / M2.5-highspeed / M2.1 / M2.1-highspeed / M2. Best for text chat.",
+        "type": "minimax_anthropic",
+        "api_key": "${MINIMAX_API_KEY}",
+        "base_url": "https://api.minimaxi.com/anthropic",
+        "anthropic_version": "2023-06-01",
+        "models": {
+          "text": "MiniMax-M2.7-highspeed"
+        }
+      },
+
+      "minimax": {
+        "_doc": "Minimax via the native v2 API. Used for TTS and vision (the Anthropic-compatible endpoint above does not expose those).",
+        "type": "minimax",
+        "api_key": "${MINIMAX_API_KEY}",
+        "group_id": "${MINIMAX_GROUP_ID}",
+        "base_url": "https://api.minimaxi.com/v1",
+        "default_voice": "female-shaonv",
+        "models": {
+          "text": "MiniMax-Text-01",
+          "tts":  "speech-01-turbo",
+          "vision": "MiniMax-VL-01"
+        }
+      },
+
+      "mimo": {
+        "_doc": "小米 MiMo TTS（v2.5）。两个接入入口：(a) 普通 API base_url=https://api.xiaomimimo.com/v1 + 用 OpenAI SDK 风格 Bearer 鉴权；(b) TokenPlan 包月 base_url=https://token-plan-cn.xiaomimimo.com/v1 + api-key 头。本代码两个鉴权头都发，自动兼容。模型：mimo-v2.5-tts / -voicedesign / -voiceclone。",
+        "type": "mimo",
+        "api_key": "${MIMO_API_KEY}",
+        "base_url": "https://token-plan-cn.xiaomimimo.com/v1",
+        "default_voice": "Chloe",
+        "format": "wav",
+        "models": {
+          "tts": "mimo-v2.5-tts"
+        }
+      }
+    }
+  }
+}

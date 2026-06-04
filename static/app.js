@@ -22,6 +22,8 @@ const noteHintEl = document.getElementById('note-hint');
 let currentPath = null;
 // annotations cache for current root: { files: {path:{...}}, tag_palette: [...] }
 let annoCache = { files: {}, tag_palette: [] };
+// Paths flagged as scanned (image-only) PDFs.
+let scannedPaths = new Set();
 let currentView = 'all'; // all | starred | tagged
 let currentRootKey = '';  // used for namespacing localStorage
 
@@ -160,7 +162,7 @@ function renderNodes(nodes, openSet) {
 }
 
 function refreshAllBadges() {
-  // Update star/tag badges for all rendered file items based on annoCache
+  // Update star/tag/scanned badges for all rendered file items based on annoCache + scanned set
   const badgeNodes = treeEl.querySelectorAll('[data-badge-for]');
   badgeNodes.forEach(node => {
     const path = node.getAttribute('data-badge-for');
@@ -169,6 +171,9 @@ function refreshAllBadges() {
     if (a.starred) html += '<span class="badge-star">★</span>';
     if (Array.isArray(a.tags)) {
       a.tags.forEach(t => { html += `<span class="badge-tag">${escapeHtml(t)}</span>`; });
+    }
+    if (scannedPaths.has(path)) {
+      html += '<span class="badge-scanned" title="扫描版 PDF — 无文本层，不可搜索/AI 整理">📷</span>';
     }
     node.innerHTML = html;
   });
@@ -281,6 +286,13 @@ async function openFile(node, li) {
   noteBtn.style.display = '';
   renderAnnoBar();
   closePopovers();
+  // AI panel: just show the button; DO NOT fetch eligibility here —
+  // it triggers pypdf extraction on the server and competes with the
+  // PDF download we're about to fire. Eligibility is loaded lazily
+  // when the user actually opens the AI panel.
+  if (typeof onFileSelected === 'function') {
+    onFileSelected(node.path);
+  }
 
   viewerEl.innerHTML = '<div class="loading">加载中…</div>';
   viewerEl.scrollTop = 0;
@@ -399,30 +411,47 @@ function applyFilter(root, kw) {
   return anyVisible;
 }
 
+async function apiErrorText(r) {
+  const j = await r.json().catch(() => ({}));
+  return j.detail || ('HTTP ' + r.status);
+}
+
+async function switchRootPath(path) {
+  const r = await fetch('/api/root', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path }),
+  });
+  if (!r.ok) throw new Error(await apiErrorText(r));
+  resetWorkspaceView();
+  await bootstrap();
+}
+
+async function promptRootPath(reason) {
+  const fallback = (rootPathEl.textContent || '').trim();
+  const manual = prompt(reason + '\n\n\u8bf7\u8f93\u5165\u8d44\u6599\u76ee\u5f55\u5b8c\u6574\u8def\u5f84:', fallback);
+  if (!manual || !manual.trim()) return;
+  await switchRootPath(manual.trim());
+}
+
 pickBtn.addEventListener('click', async () => {
   pickBtn.disabled = true;
-  pickBtn.textContent = '选择中…';
+  pickBtn.textContent = '\u9009\u62e9\u4e2d...';
   try {
     const r = await fetch('/api/pick-folder', { method: 'POST' });
+    if (!r.ok) throw new Error(await apiErrorText(r));
     const d = await r.json();
     if (!d.path) return;
-    const r2 = await fetch('/api/root', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: d.path }),
-    });
-    if (!r2.ok) {
-      const j = await r2.json().catch(() => ({}));
-      alert('切换目录失败：' + (j.detail || r2.status));
-      return;
-    }
-    resetWorkspaceView();
-    await bootstrap();
+    await switchRootPath(d.path);
   } catch (err) {
-    alert('切换目录出错：' + err);
+    try {
+      await promptRootPath('\u7cfb\u7edf\u76ee\u5f55\u9009\u62e9\u4e0d\u53ef\u7528: ' + (err.message || err));
+    } catch (manualErr) {
+      alert('\u5207\u6362\u76ee\u5f55\u5931\u8d25: ' + (manualErr.message || manualErr));
+    }
   } finally {
     pickBtn.disabled = false;
-    pickBtn.textContent = '📁 切换';
+    pickBtn.textContent = '\u5207\u6362';
   }
 });
 
@@ -479,6 +508,7 @@ function _itemVisible(li) {
 // --- Annotations ---
 async function loadAnno() {
   const r = await fetch('/api/anno/all');
+  if (!r.ok) throw new Error(await apiErrorText(r));
   annoCache = await r.json();
   refreshAllBadges();
   if (currentPath) renderAnnoBar();  // refresh anno panel for already-open file
@@ -490,7 +520,7 @@ async function patchAnno(path, partial) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(partial),
   });
-  if (!r.ok) throw new Error('save failed: ' + r.status);
+  if (!r.ok) throw new Error('save failed: ' + await apiErrorText(r));
   const entry = await r.json();
   // update local cache
   if (Object.keys(entry).length) {
@@ -577,7 +607,9 @@ async function toggleTag(t) {
   renderAnnoBar();
 }
 
-starBtn.addEventListener('click', toggleStar);
+starBtn.addEventListener('click', () => {
+  toggleStar().catch(err => alert('Save failed: ' + (err.message || err)));
+});
 
 addTagBtn.addEventListener('click', async () => {
   const name = (prompt('新标签名（之后所有文件都可用）：') || '').trim();
@@ -592,6 +624,7 @@ addTagBtn.addEventListener('click', async () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ tags: palette }),
     });
+    if (!r.ok) throw new Error(await apiErrorText(r));
     const d = await r.json();
     annoCache.tag_palette = d.palette;
   }
@@ -673,10 +706,41 @@ async function pollPreconvert() {
 }
 setInterval(pollPreconvert, 1500);
 
+// --- Scanned-PDF list poll ---
+let _scannedPollTimer = null;
+let _scannedPrebuildSeenDone = false;
+
+async function loadScanned() {
+  try {
+    const r = await fetch('/api/search/scanned');
+    const d = await r.json();
+    const prevCount = scannedPaths.size;
+    scannedPaths = new Set(d.scanned || []);
+    if (scannedPaths.size !== prevCount) refreshAllBadges();
+  } catch {}
+}
+
+async function _scannedPollStep() {
+  await loadScanned();
+  // Stop polling once prebuild finishes (the scanned set is stable from then on).
+  try {
+    const s = await (await fetch('/api/search/status')).json();
+    if (!s.running && s.total > 0) {
+      _scannedPrebuildSeenDone = true;
+    }
+  } catch {}
+  if (_scannedPrebuildSeenDone) {
+    if (_scannedPollTimer) { clearInterval(_scannedPollTimer); _scannedPollTimer = null; }
+  }
+}
+// Only poll while the index is still building.
+_scannedPollTimer = setInterval(_scannedPollStep, 5000);
+
 async function bootstrap() {
   const info = await refreshRoot();
   await loadTree();
   await loadAnno();
+  await loadScanned();
   if (info.last_file) {
     setTimeout(() => openFileByPath(info.last_file), 0);
   }
@@ -733,8 +797,9 @@ treeEl.addEventListener('contextmenu', (e) => {
         if (path === currentPath) renderAnnoBar();
     } },
     { label: '📂 在资源管理器打开', action: async () => {
-        await fetch('/api/reveal', { method: 'POST', headers: {'Content-Type':'application/json'},
-                                     body: JSON.stringify({ path }) });
+        const r = await fetch('/api/reveal', { method: 'POST', headers: {'Content-Type':'application/json'},
+                                               body: JSON.stringify({ path }) });
+        if (!r.ok) alert('Open failed: ' + await apiErrorText(r));
     } },
     { label: '📋 复制路径', action: async () => {
         const fullPath = (rootPathEl.textContent || '') + '\\' + path.replace(/\//g, '\\');
@@ -888,6 +953,672 @@ searchInput.addEventListener('keydown', (e) => {
     } catch {}
   });
 })();
+
+// =====================================================================
+// AI panel
+// =====================================================================
+const aiBtn         = document.getElementById('ai-btn');
+const aiDot         = document.getElementById('ai-dot');
+const aiPanel       = document.getElementById('ai-panel');
+const aiResizer     = document.getElementById('ai-resizer');
+const aiDockToggle  = document.getElementById('ai-dock-toggle');
+const aiClose       = document.getElementById('ai-close');
+const aiProviderEl  = document.getElementById('ai-provider');
+const aiEligibility = document.getElementById('ai-eligibility');
+const aiConv        = document.getElementById('ai-conv');
+const aiInput       = document.getElementById('ai-input');
+const aiSend        = document.getElementById('ai-send');
+const aiSummarize   = document.getElementById('ai-summarize');
+const aiTtsLast     = document.getElementById('ai-tts-last');
+const aiClear       = document.getElementById('ai-clear');
+const mainBodyEl    = document.querySelector('.main-body');
+
+let aiStatusCache = null;        // /api/ai/status response
+let aiEligibilityCache = null;   // /api/file/ai-eligibility for currentPath
+let aiConversation = [];         // [{role, content}]
+let aiBusy = false;
+
+const AI_LS = {
+  width:    'browse:aiPanelW',
+  mode:     'browse:aiPanelMode',    // 'dock' | 'float'
+};
+
+// ---------- minimal Markdown renderer (handles common AI output) ----------
+// Supports: code fences, inline code, headings, bold/italic, lists (ul/ol),
+// blockquotes, horizontal rules, line breaks. Safe by HTML-escaping all text
+// before inserting markup.
+function renderMarkdown(src) {
+  if (!src) return '';
+  const escape = (s) => s.replace(/[&<>"']/g, c =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+  // 1. Pull out fenced code blocks first (so their content isn't touched)
+  const codeBlocks = [];
+  let s = src.replace(/```([a-zA-Z0-9_+-]*)\r?\n([\s\S]*?)```/g, (_, lang, code) => {
+    const i = codeBlocks.length;
+    codeBlocks.push(`<pre><code>${escape(code.replace(/\r?\n$/, ''))}</code></pre>`);
+    return ` CB${i} `;
+  });
+
+  // 2. Escape everything else
+  s = escape(s);
+
+  // 3. Inline code `…`
+  s = s.replace(/`([^`\n]+)`/g, '<code>$1</code>');
+
+  // 4. Bold ** and italic *
+  s = s.replace(/\*\*\*([^*\n]+)\*\*\*/g, '<strong><em>$1</em></strong>');
+  s = s.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+  s = s.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>');
+
+  // 5. Headings (h1-h4)
+  s = s.replace(/^####\s+(.+)$/gm, '<h4>$1</h4>');
+  s = s.replace(/^###\s+(.+)$/gm,  '<h3>$1</h3>');
+  s = s.replace(/^##\s+(.+)$/gm,   '<h2>$1</h2>');
+  s = s.replace(/^#\s+(.+)$/gm,    '<h1>$1</h1>');
+
+  // 6. Horizontal rule
+  s = s.replace(/^---+$/gm, '<hr>');
+
+  // 7. Lists & blockquotes (per-line state machine)
+  const lines = s.split('\n');
+  const out = [];
+  let listType = null;     // 'ul' | 'ol' | null
+  let inBq = false;
+  function closeList() { if (listType) { out.push(`</${listType}>`); listType = null; } }
+  function closeBq()   { if (inBq) { out.push('</blockquote>'); inBq = false; } }
+  for (const raw of lines) {
+    const line = raw;
+    const ulM = line.match(/^[-*+]\s+(.+)$/);
+    const olM = line.match(/^(\d+)\.\s+(.+)$/);
+    const bqM = line.match(/^&gt;\s?(.*)$/);
+    if (ulM) {
+      closeBq();
+      if (listType !== 'ul') { closeList(); out.push('<ul>'); listType = 'ul'; }
+      out.push(`<li>${ulM[1]}</li>`);
+    } else if (olM) {
+      closeBq();
+      if (listType !== 'ol') { closeList(); out.push('<ol>'); listType = 'ol'; }
+      out.push(`<li>${olM[2]}</li>`);
+    } else if (bqM) {
+      closeList();
+      if (!inBq) { out.push('<blockquote>'); inBq = true; }
+      out.push(bqM[1] || '');
+    } else {
+      closeList(); closeBq();
+      out.push(line);
+    }
+  }
+  closeList(); closeBq();
+  s = out.join('\n');
+
+  // 8. Paragraphs (split on blank line; don't wrap block-level elements)
+  s = s.split(/\n{2,}/).map(block => {
+    block = block.trim();
+    if (!block) return '';
+    if (/^<(h[1-6]|ul|ol|blockquote|pre|hr)\b/.test(block) || /^ CB\d+ /.test(block)) {
+      return block;
+    }
+    return `<p>${block.replace(/\n/g, '<br>')}</p>`;
+  }).join('\n');
+
+  // 9. Restore code blocks
+  s = s.replace(/ CB(\d+) /g, (_, i) => codeBlocks[parseInt(i, 10)]);
+
+  return s;
+}
+
+async function fetchAiStatus() {
+  try {
+    const r = await fetch('/api/ai/status');
+    if (!r.ok) return null;
+    aiStatusCache = await r.json();
+    return aiStatusCache;
+  } catch { return null; }
+}
+
+function aiCanText()  { return !!(aiStatusCache && aiStatusCache.text); }
+function aiCanTts()   { return !!(aiStatusCache && aiStatusCache.tts);  }
+
+async function loadEligibility(path) {
+  if (!path) return null;
+  try {
+    const r = await fetch('/api/file/ai-eligibility?path=' + encodeURIComponent(path));
+    if (!r.ok) return null;
+    aiEligibilityCache = await r.json();
+    return aiEligibilityCache;
+  } catch { return null; }
+}
+
+function updateAiButton() {
+  // Always show the button when a file is open so the entry is discoverable.
+  // The actual availability check (provider configured + file eligible)
+  // happens lazily when the user clicks it.
+  if (!currentPath) {
+    aiBtn.style.display = 'none';
+    return;
+  }
+  aiBtn.style.display = '';
+  if (!aiCanText()) {
+    aiBtn.style.opacity = '0.55';
+    aiBtn.title = 'AI 未配置：在 config.json 的 ai 块填好 api_key 后重启服务（参考 config.example.json）';
+    return;
+  }
+  // Configured but eligibility not yet checked — neutral state
+  if (!aiEligibilityCache) {
+    aiBtn.style.opacity = '1';
+    aiBtn.title = 'AI 助手 (A)';
+    return;
+  }
+  const ok = aiEligibilityCache.supported;
+  aiBtn.style.opacity = ok ? '1' : '0.55';
+  aiBtn.title = ok ? 'AI 助手 (A)' :
+    'AI 不可用: ' + ((aiEligibilityCache.reasons || []).join('; '));
+}
+
+function renderEligibilityNotice() {
+  if (!aiEligibilityCache) { aiEligibility.textContent = ''; return; }
+  const reasons = aiEligibilityCache.reasons || [];
+  if (reasons.length === 0 || aiEligibilityCache.mode === 'direct') {
+    aiEligibility.textContent = '';
+    return;
+  }
+  aiEligibility.textContent = '⚠ ' + reasons.join('；');
+}
+
+function renderProviderInfo() {
+  if (!aiStatusCache || !aiStatusCache.text) {
+    aiProviderEl.textContent = '未配置';
+    return;
+  }
+  const t = aiStatusCache.text;
+  const tts = aiCanTts() ? ' · TTS:' + aiStatusCache.tts.name : '';
+  aiProviderEl.textContent = `text:${t.name}${tts}`;
+}
+
+function aiAppendMessage(role, content, { streaming = false } = {}) {
+  const el = document.createElement('div');
+  el.className = 'ai-msg ' + role + (streaming ? ' streaming' : '');
+  const label = document.createElement('div');
+  label.className = 'role-label';
+  label.textContent = role === 'user' ? '我' : 'AI';
+  el.appendChild(label);
+  const body = document.createElement('div');
+  body.className = 'msg-body md-body';
+  // Track the raw text separately from the rendered markdown so copy/tts
+  // operate on plain text, not HTML.
+  body.dataset.raw = content || '';
+  body.innerHTML = role === 'user'
+    ? `<p>${escapeHtml(content || '').replace(/\n/g, '<br>')}</p>`
+    : renderMarkdown(content || '');
+  el.appendChild(body);
+  if (role === 'assistant') {
+    const actions = document.createElement('div');
+    actions.className = 'msg-actions';
+    actions.innerHTML = '<button class="copy" type="button">📋 复制</button>' +
+                       (aiCanTts() ? '<button class="tts" type="button">🔊 朗读</button>' : '');
+    el.appendChild(actions);
+    actions.querySelector('.copy').addEventListener('click', async () => {
+      try { await navigator.clipboard.writeText(body.dataset.raw || ''); } catch {}
+    });
+    const ttsBtn = actions.querySelector('.tts');
+    if (ttsBtn) {
+      ttsBtn.addEventListener('click', () => {
+        // If already playing this very message, stop. Otherwise start fresh.
+        if (_ttsCurrent && _ttsCurrent.btn === ttsBtn) {
+          _ttsStop();
+        } else {
+          aiPlayTts(body.dataset.raw || '', ttsBtn);
+        }
+      });
+    }
+  }
+  aiConv.appendChild(el);
+  aiConv.scrollTop = aiConv.scrollHeight;
+  return { el, body };
+}
+
+// Update body for streaming: update both raw text + re-render markdown.
+// Throttled with rAF so re-rendering doesn't fire on every token.
+let _renderTimer = null;
+function aiUpdateStreaming(body, raw) {
+  body.dataset.raw = raw;
+  if (_renderTimer) return;
+  _renderTimer = requestAnimationFrame(() => {
+    _renderTimer = null;
+    body.innerHTML = renderMarkdown(body.dataset.raw);
+    aiConv.scrollTop = aiConv.scrollHeight;
+  });
+}
+function aiFinalizeStreaming(body) {
+  if (_renderTimer) { cancelAnimationFrame(_renderTimer); _renderTimer = null; }
+  body.innerHTML = renderMarkdown(body.dataset.raw || '');
+  aiConv.scrollTop = aiConv.scrollHeight;
+}
+
+function aiClearConv() {
+  aiConv.innerHTML = '';
+  aiConversation = [];
+}
+
+async function aiStream(url, payload, onDelta) {
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!r.ok) {
+    const t = await r.text().catch(() => '');
+    throw new Error('HTTP ' + r.status + ' ' + t.slice(0, 200));
+  }
+  const reader = r.body.getReader();
+  const decoder = new TextDecoder('utf-8');
+  let buf = '';
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let nl;
+    while ((nl = buf.indexOf('\n\n')) >= 0) {
+      const frame = buf.slice(0, nl).trim();
+      buf = buf.slice(nl + 2);
+      if (!frame.startsWith('data:')) continue;
+      const data = frame.slice(5).trim();
+      if (data === '[DONE]') return;
+      try {
+        const obj = JSON.parse(data);
+        if (obj.delta) onDelta(obj.delta);
+        if (obj.error) throw new Error(obj.error);
+      } catch (e) {
+        if (e instanceof SyntaxError) continue;
+        throw e;
+      }
+    }
+  }
+}
+
+async function ensureEligible() {
+  if (!currentPath) return false;
+  if (!aiEligibilityCache) {
+    await loadEligibility(currentPath);
+    renderEligibilityNotice();
+    updateAiButton();
+  }
+  if (!aiEligibilityCache || !aiEligibilityCache.supported) {
+    alert((aiEligibilityCache && aiEligibilityCache.reasons || ['AI 不可用']).join('\n'));
+    return false;
+  }
+  return true;
+}
+
+async function aiSendQuestion() {
+  if (aiBusy || !currentPath) return;
+  if (!(await ensureEligible())) return;
+  const q = aiInput.value.trim();
+  if (!q) return;
+  aiInput.value = '';
+  aiAppendMessage('user', q);
+  aiConversation.push({ role: 'user', content: q });
+  const { el, body } = aiAppendMessage('assistant', '', { streaming: true });
+  aiBusy = true; aiSend.disabled = true;
+  let acc = '';
+  try {
+    await aiStream('/api/ai/chat', {
+      path: currentPath,
+      question: q,
+      history: aiConversation.slice(0, -1),
+      stream: true,
+    }, (d) => {
+      acc += d;
+      aiUpdateStreaming(body, acc);
+    });
+    aiFinalizeStreaming(body);
+    aiConversation.push({ role: 'assistant', content: acc });
+  } catch (err) {
+    body.dataset.raw = '⚠ ' + (err.message || err);
+    body.innerHTML = `<p>${escapeHtml(body.dataset.raw)}</p>`;
+  } finally {
+    el.classList.remove('streaming');
+    aiBusy = false; aiSend.disabled = false;
+  }
+}
+
+async function aiDoSummarize() {
+  if (aiBusy || !currentPath) return;
+  if (!(await ensureEligible())) return;
+  const { el, body } = aiAppendMessage('assistant', '', { streaming: true });
+  aiBusy = true; aiSummarize.disabled = true;
+  let acc = '';
+  try {
+    await aiStream('/api/ai/summarize', {
+      path: currentPath, stream: true, force: false,
+    }, (d) => {
+      acc += d;
+      aiUpdateStreaming(body, acc);
+    });
+    aiFinalizeStreaming(body);
+    aiConversation.push({ role: 'assistant', content: acc });
+  } catch (err) {
+    body.dataset.raw = '⚠ ' + (err.message || err);
+    body.innerHTML = `<p>${escapeHtml(body.dataset.raw)}</p>`;
+  } finally {
+    el.classList.remove('streaming');
+    aiBusy = false; aiSummarize.disabled = false;
+  }
+}
+
+// ---------- TTS singleton ----------
+// Only one Audio plays at a time. Buttons toggle between play / stop.
+let _ttsCurrent = null;   // { audio, url, btn }
+let _ttsLoading = null;   // path-like key to dedupe concurrent fetches
+
+function _ttsStop() {
+  if (!_ttsCurrent) return;
+  try { _ttsCurrent.audio.pause(); } catch {}
+  if (_ttsCurrent.url) URL.revokeObjectURL(_ttsCurrent.url);
+  if (_ttsCurrent.btn) {
+    _ttsCurrent.btn.classList.remove('playing');
+    _ttsCurrent.btn.textContent = '🔊 朗读';
+  }
+  _ttsCurrent = null;
+}
+
+async function aiPlayTts(text, btn) {
+  if (!aiCanTts() || !text) return;
+  // Stop any current playback first.
+  _ttsStop();
+  // Dedupe rapid double-clicks while the audio is still downloading.
+  if (_ttsLoading === text) return;
+  _ttsLoading = text;
+  if (btn) {
+    btn.classList.add('playing');
+    btn.textContent = '⏳ 生成…';
+  }
+  try {
+    const r = await fetch('/api/ai/tts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: text.slice(0, 4000) }),
+    });
+    if (_ttsLoading !== text) return;  // user clicked another in the meantime
+    if (!r.ok) {
+      const t = await r.text().catch(() => '');
+      alert('TTS 失败：HTTP ' + r.status + ' ' + t.slice(0, 200));
+      return;
+    }
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const audio = new Audio(url);
+    _ttsCurrent = { audio, url, btn };
+    if (btn) btn.textContent = '⏹ 停止';
+    audio.addEventListener('ended', () => _ttsStop());
+    audio.addEventListener('error', () => _ttsStop());
+    await audio.play().catch(err => {
+      console.error('audio play failed', err);
+      _ttsStop();
+    });
+  } catch (err) {
+    alert('TTS 出错: ' + (err.message || err));
+    _ttsStop();
+  } finally {
+    if (_ttsLoading === text) _ttsLoading = null;
+  }
+}
+
+// ---------- AI panel dock/float + width persistence ----------
+function _applyAiMode() {
+  const mode = localStorage.getItem(AI_LS.mode) || 'dock';
+  mainBodyEl.classList.toggle('float-mode', mode === 'float');
+  aiDockToggle.title = mode === 'dock'
+    ? '点击切换为浮层模式（不挤压主区）'
+    : '点击切换为侧栏模式（挤压主区）';
+  aiDockToggle.textContent = mode === 'dock' ? '⇆' : '◧';
+}
+function _applyAiWidth() {
+  const w = parseInt(localStorage.getItem(AI_LS.width) || '', 10);
+  if (Number.isFinite(w) && w >= 280 && w <= 900) {
+    aiPanel.style.width = w + 'px';
+  }
+}
+_applyAiMode();
+_applyAiWidth();
+
+async function aiOpenPanel() {
+  // Refuse to open if AI not configured — give the user a clear, copyable hint
+  if (!aiCanText()) {
+    alert(
+      'AI 尚未启用。\n\n' +
+      '1) 复制 config.example.json 里的 ai 块到你的 config.json\n' +
+      '2) 设置环境变量 MINIMAX_API_KEY（在 start.bat 加 set ... 或者系统设置）\n' +
+      '3) 重启服务'
+    );
+    return;
+  }
+  aiPanel.hidden = false;
+  // Only show the resizer when docked.
+  aiResizer.hidden = mainBodyEl.classList.contains('float-mode');
+  // Lazy eligibility fetch — runs in background, doesn't block panel open
+  if (!aiEligibilityCache && currentPath) {
+    loadEligibility(currentPath).then(() => {
+      renderEligibilityNotice();
+      updateAiButton();
+    });
+  }
+  setTimeout(() => aiInput.focus(), 50);
+}
+function aiClosePanel() {
+  aiPanel.hidden = true;
+  aiResizer.hidden = true;
+}
+
+aiDockToggle.addEventListener('click', () => {
+  const cur = localStorage.getItem(AI_LS.mode) || 'dock';
+  const next = cur === 'dock' ? 'float' : 'dock';
+  localStorage.setItem(AI_LS.mode, next);
+  _applyAiMode();
+  // re-evaluate resizer visibility
+  if (!aiPanel.hidden) {
+    aiResizer.hidden = next === 'float';
+  }
+});
+
+// AI panel resize handle
+(function setupAiResizer() {
+  let dragging = false;
+  aiResizer.addEventListener('mousedown', (e) => {
+    if (aiPanel.hidden) return;
+    dragging = true;
+    document.body.classList.add('resizing');
+    aiResizer.classList.add('dragging');
+    e.preventDefault();
+  });
+  document.addEventListener('mousemove', (e) => {
+    if (!dragging) return;
+    const rect = mainBodyEl.getBoundingClientRect();
+    // panel sits at the right; width = rect.right - mouseX
+    const w = Math.max(280, Math.min(900, rect.right - e.clientX));
+    aiPanel.style.width = w + 'px';
+  });
+  document.addEventListener('mouseup', () => {
+    if (!dragging) return;
+    dragging = false;
+    document.body.classList.remove('resizing');
+    aiResizer.classList.remove('dragging');
+    try {
+      localStorage.setItem(AI_LS.width,
+        String(aiPanel.getBoundingClientRect().width | 0));
+    } catch {}
+  });
+})();
+
+aiBtn.addEventListener('click', aiOpenPanel);
+aiClose.addEventListener('click', aiClosePanel);
+aiSend.addEventListener('click', aiSendQuestion);
+aiInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    aiSendQuestion();
+  } else if (e.key === 'Escape') {
+    aiClosePanel();
+  }
+});
+aiSummarize.addEventListener('click', aiDoSummarize);
+aiClear.addEventListener('click', aiClearConv);
+aiTtsLast.addEventListener('click', () => {
+  // Toolbar 朗读 toggles: if anything is currently playing, stop. Otherwise
+  // play the latest AI message.
+  if (_ttsCurrent) { _ttsStop(); return; }
+  const last = [...aiConv.querySelectorAll('.ai-msg.assistant .msg-body')].pop();
+  if (last) aiPlayTts(last.dataset.raw || '', aiTtsLast);
+});
+
+document.addEventListener('keydown', (e) => {
+  const ae = document.activeElement;
+  if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.isContentEditable)) return;
+  if (e.key === 'a' || e.key === 'A') {
+    if (!currentPath) return;
+    e.preventDefault();
+    if (aiPanel.hidden) aiOpenPanel(); else aiClosePanel();
+  }
+});
+
+// Called after each openFile completes. Intentionally cheap — does NOT
+// hit any API. Eligibility is loaded lazily inside aiOpenPanel().
+function onFileSelected(path) {
+  aiEligibilityCache = null;     // stale; will reload when needed
+  aiEligibility.textContent = '';
+  updateAiButton();
+}
+
+(async () => {
+  await fetchAiStatus();
+  renderProviderInfo();
+  updateAiButton();
+})();
+
+// =====================================================================
+// Sidebar cache footer + details popover
+// =====================================================================
+const cacheFooterBtn  = document.getElementById('cache-footer-btn');
+const cacheFooterSize = document.getElementById('cache-footer-size');
+const cachePop        = document.getElementById('cache-pop');
+const cachePopClose   = document.getElementById('cache-pop-close');
+const cachePopTable   = document.getElementById('cache-pop-table');
+const cacheCleanupBtn = document.getElementById('cache-cleanup-btn');
+const cacheClearPdfBtn = document.getElementById('cache-clear-pdf-btn');
+const cacheClearTtsBtn = document.getElementById('cache-clear-tts-btn');
+
+function fmtBytes(n) {
+  if (!n) return '0 B';
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  if (n < 1024 * 1024 * 1024) return (n / 1024 / 1024).toFixed(1) + ' MB';
+  return (n / 1024 / 1024 / 1024).toFixed(2) + ' GB';
+}
+
+async function fetchCacheStats() {
+  try {
+    const r = await fetch('/api/cache/stats');
+    if (!r.ok) return null;
+    return await r.json();
+  } catch { return null; }
+}
+
+function renderCacheFooter(stats) {
+  if (!stats) { cacheFooterSize.textContent = '—'; return; }
+  cacheFooterSize.textContent = '已用 ' + fmtBytes(stats.total_bytes || 0);
+}
+
+function renderCachePopTable(stats) {
+  if (!stats) { cachePopTable.innerHTML = ''; return; }
+  const rows = [
+    { label: '📕 Office → PDF', s: stats.office_pdf, useLimit: true },
+    { label: '🔊 TTS 音频',     s: stats.tts_audio, useLimit: true },
+    { label: '🔍 全文索引',     s: stats.search_index, useLimit: false },
+    { label: '📜 日志',         s: stats.logs, useLimit: false },
+  ];
+  let html = '<thead><tr><th>类别</th><th class="size">大小</th><th>占用</th></tr></thead><tbody>';
+  for (const r of rows) {
+    const used = r.s.bytes || 0;
+    const limit = r.useLimit ? (r.s.limit_bytes || 0) : 0;
+    const ratio = limit ? Math.min(1, used / limit) : 0;
+    const over = limit && used > limit * 0.85;
+    let bar = '';
+    if (limit) {
+      bar = `<div class="bar${over ? ' over' : ''}"><span style="width:${(ratio*100).toFixed(1)}%"></span></div>
+             <div style="font-size:10px;color:#aaa">上限 ${fmtBytes(limit)}</div>`;
+    }
+    html += `<tr><td>${r.label}<div style="font-size:10px;color:#aaa">${r.s.files} 个文件</div></td>` +
+            `<td class="size">${fmtBytes(used)}</td>` +
+            `<td class="bar-cell">${bar}</td></tr>`;
+  }
+  html += `<tr><td><strong>合计</strong></td><td class="size"><strong>${fmtBytes(stats.total_bytes || 0)}</strong></td><td></td></tr>`;
+  html += '</tbody>';
+  cachePopTable.innerHTML = html;
+}
+
+async function refreshCacheUi() {
+  const stats = await fetchCacheStats();
+  renderCacheFooter(stats);
+  if (!cachePop.hidden) renderCachePopTable(stats);
+  return stats;
+}
+
+cacheFooterBtn.addEventListener('click', async (e) => {
+  e.stopPropagation();
+  cachePop.hidden = !cachePop.hidden;
+  if (!cachePop.hidden) await refreshCacheUi();
+});
+cachePopClose.addEventListener('click', () => { cachePop.hidden = true; });
+document.addEventListener('click', (e) => {
+  if (cachePop.hidden) return;
+  if (cachePop.contains(e.target) || e.target === cacheFooterBtn) return;
+  cachePop.hidden = true;
+});
+
+async function _busyAround(btn, label, fn) {
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = label;
+  try { return await fn(); }
+  finally { btn.disabled = false; btn.textContent = orig; }
+}
+
+cacheCleanupBtn.addEventListener('click', async () => {
+  await _busyAround(cacheCleanupBtn, '清理中…', async () => {
+    const r = await fetch('/api/cache/cleanup', { method: 'POST' });
+    const d = await r.json().catch(() => ({}));
+    const a = (d.office_pdf || {}).removed || 0;
+    const b = (d.tts_audio  || {}).removed || 0;
+    alert(`已清理：PDF ${a} 项 / TTS ${b} 项`);
+    await refreshCacheUi();
+  });
+});
+
+cacheClearPdfBtn.addEventListener('click', async () => {
+  if (!confirm('完全清空 Office→PDF 缓存？下次打开 doc/docx/xlsx 等会重新转换（慢一次）。')) return;
+  await _busyAround(cacheClearPdfBtn, '清空中…', async () => {
+    const r = await fetch('/api/cache/clear', { method: 'POST' });
+    const d = await r.json().catch(() => ({}));
+    alert(`已清空：${d.removed || 0} 项${d.skipped ? `（${d.skipped} 项被占用未删）` : ''}`);
+    await refreshCacheUi();
+  });
+});
+
+cacheClearTtsBtn.addEventListener('click', async () => {
+  if (!confirm('完全清空 TTS 音频缓存？下次朗读会重新调用 API（花一次 token）。')) return;
+  await _busyAround(cacheClearTtsBtn, '清空中…', async () => {
+    const r = await fetch('/api/ai/tts/clear', { method: 'POST' });
+    const d = await r.json().catch(() => ({}));
+    alert(`已清空：${d.removed || 0} 项`);
+    await refreshCacheUi();
+  });
+});
+
+// Initial fetch + refresh every 30s while window is visible.
+refreshCacheUi();
+setInterval(() => {
+  if (document.visibilityState === 'visible') refreshCacheUi();
+}, 30_000);
 
 bootstrap().catch(err => {
   treeEl.innerHTML = `<div style="padding:12px;color:#b00">加载失败：${escapeHtml(String(err))}</div>`;

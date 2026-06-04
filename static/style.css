@@ -44,6 +44,7 @@ body.resizing iframe { pointer-events: none; }
 .tree li.file .badges { margin-left: 4px; font-size: 11px; }
 .tree li.file .badge-star { color: #f5b400; }
 .tree li.file .badge-tag { display:inline-block; padding: 0 4px; margin-left: 3px; border-radius: 8px; background: #e8efff; color: #2d6cdf; font-size: 10px; vertical-align: 1px; }
+.tree li.file .badge-scanned { margin-left: 4px; font-size: 11px; opacity: 0.7; cursor: help; }
 .tree { flex: 1; overflow: auto; padding: 6px 0; font-size: 13px; }
 .tree ul { list-style: none; margin: 0; padding-left: 16px; }
 .tree li { line-height: 1.7; white-space: nowrap; cursor: pointer; user-select: none; }
@@ -54,9 +55,45 @@ body.resizing iframe { pointer-events: none; }
 .tree li.file .label:hover { background: #eef3ff; }
 .tree li.file.active > .label { background: #2d6cdf; color: #fff; }
 .tree li.hidden, .tree li.view-hidden { display: none; }
+
+/* ----- Sidebar cache footer ----- */
+.cache-footer {
+  flex: 0 0 auto; border-top: 1px solid #eee; background: #fff;
+  padding: 4px 8px;
+}
+.cache-footer button {
+  width: 100%; text-align: left;
+  background: transparent; border: 0; padding: 4px 6px;
+  font-size: 11px; color: #888; cursor: pointer; border-radius: 3px;
+}
+.cache-footer button:hover { background: #f0f3fa; color: #2d6cdf; }
+
+.cache-pop {
+  position: fixed; bottom: 8px; left: 8px;
+  z-index: 80; max-width: 360px; min-width: 280px;
+  background: #fff; border: 1px solid #ddd; border-radius: 6px;
+  box-shadow: 0 6px 24px rgba(0,0,0,.15);
+  padding: 10px 12px; font-size: 12px;
+}
+.cache-pop[hidden] { display: none; }
+.cache-pop-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+.cache-pop-head strong { font-size: 13px; }
+.cache-pop-head button { border: 1px solid #ddd; background: #fff; padding: 0 6px; border-radius: 3px; cursor: pointer; font-size: 14px; line-height: 1.4; }
+.cache-table { width: 100%; border-collapse: collapse; margin: 6px 0; }
+.cache-table th, .cache-table td { padding: 4px 6px; border-bottom: 1px solid #f0f0f0; text-align: left; }
+.cache-table th { font-weight: 500; color: #777; font-size: 11px; }
+.cache-table td.size { text-align: right; font-variant-numeric: tabular-nums; }
+.cache-table td.bar-cell { width: 80px; }
+.cache-table .bar { display: block; height: 4px; background: #eef2f7; border-radius: 2px; position: relative; overflow: hidden; }
+.cache-table .bar > span { display: block; height: 100%; background: #2d6cdf; }
+.cache-table .bar.over > span { background: #d9534f; }
+.cache-pop-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+.cache-pop-actions button { font-size: 11px; padding: 3px 8px; border: 1px solid #ccc; background: #fafafa; border-radius: 3px; cursor: pointer; }
+.cache-pop-actions button:hover:not(:disabled) { background: #eef3ff; border-color: #2d6cdf; color: #2d6cdf; }
+.cache-pop-actions button:disabled { opacity: 0.5; cursor: wait; }
 .tree .icon { margin-right: 2px; }
 
-#main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+#main { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; }
 #bar {
   height: 42px; border-bottom: 1px solid #e3e3e3;
   display: flex; align-items: center; justify-content: space-between;
@@ -135,6 +172,84 @@ body.resizing iframe { pointer-events: none; }
   padding: 8px 10px; border: 1px solid #ddd; border-radius: 4px;
   font-size: 13px; resize: vertical; font-family: inherit;
 }
+
+/* ----- AI side panel ----- */
+/* The main body is a flex row containing viewer + (optional) ai-panel.
+   Two modes:
+   - dock  (default): ai-panel is in-flow, viewer shrinks
+   - float          : ai-panel is absolute overlay, viewer stays full width
+*/
+.main-body { display: flex; flex: 1 1 auto; min-height: 0; position: relative; }
+#viewer { flex: 1 1 auto; min-width: 0; }
+.ai-resizer {
+  width: 5px; background: transparent; cursor: col-resize;
+  flex: 0 0 5px; position: relative; z-index: 6;
+}
+.ai-resizer:hover, .ai-resizer.dragging { background: #2d6cdf; }
+.ai-resizer[hidden] { display: none; }
+.ai-panel {
+  background: #fff; border-left: 1px solid #e3e3e3;
+  display: flex; flex-direction: column; min-height: 0;
+  flex: 0 0 auto;
+  width: 420px;
+  z-index: 30;
+}
+.ai-panel[hidden] { display: none; }
+/* Floating mode: panel overlays viewer */
+.main-body.float-mode .ai-panel {
+  position: absolute; right: 0; top: 0; bottom: 0;
+  box-shadow: -4px 0 12px rgba(0,0,0,.08);
+}
+.main-body.float-mode .ai-resizer { display: none; }
+
+.ai-head { padding: 8px 12px; border-bottom: 1px solid #eee; display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+.ai-head .ai-title { font-weight: 500; font-size: 13px; }
+.ai-head .hint { color: #999; font-size: 11px; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ai-head button { border: 1px solid #ddd; background: #fff; padding: 2px 8px; border-radius: 3px; cursor: pointer; font-size: 13px; line-height: 1; }
+.ai-eligibility { padding: 6px 12px; font-size: 11px; color: #b85b00; background: #fff7e6; border-bottom: 1px solid #ffe3a8; flex: 0 0 auto; }
+.ai-eligibility:empty { display: none; }
+.ai-toolbar { display: flex; gap: 6px; padding: 8px 12px; border-bottom: 1px solid #eee; flex: 0 0 auto; }
+.ai-toolbar button { font-size: 12px; padding: 4px 10px; border: 1px solid #ddd; background: #fafafa; border-radius: 4px; cursor: pointer; }
+.ai-toolbar button:hover:not(:disabled) { background: #eef3ff; border-color: #2d6cdf; color: #2d6cdf; }
+.ai-toolbar button:disabled { opacity: 0.5; cursor: not-allowed; }
+.ai-toolbar button.playing { background: #2d6cdf; color: #fff; border-color: #2d6cdf; }
+
+.ai-conv { flex: 1 1 auto; overflow-y: auto; overflow-x: hidden; padding: 10px 12px; font-size: 13px; line-height: 1.6; background: #f7f8fb; min-height: 0; }
+.ai-msg { margin-bottom: 12px; padding: 8px 10px; border-radius: 6px; }
+.ai-msg.user { background: #e8efff; }
+.ai-msg.assistant { background: #fff; border: 1px solid #eee; }
+.ai-msg.assistant.streaming .md-body::after { content: '▍'; opacity: 0.6; animation: blink 1s steps(2) infinite; margin-left: 1px; }
+@keyframes blink { 50% { opacity: 0; } }
+.ai-msg .role-label { font-size: 10px; color: #999; margin-bottom: 3px; }
+.ai-msg .msg-actions { margin-top: 6px; display: flex; gap: 4px; }
+.ai-msg .msg-actions button { font-size: 11px; padding: 2px 8px; border: 1px solid #ddd; background: #fff; border-radius: 3px; cursor: pointer; color: #666; }
+.ai-msg .msg-actions button.playing { color: #fff; background: #2d6cdf; border-color: #2d6cdf; }
+
+/* Markdown rendering inside AI messages */
+.md-body { word-wrap: break-word; }
+.md-body p { margin: 0 0 8px; }
+.md-body p:last-child { margin-bottom: 0; }
+.md-body h1, .md-body h2, .md-body h3, .md-body h4 { margin: 10px 0 6px; font-weight: 600; line-height: 1.3; }
+.md-body h1 { font-size: 1.25em; }
+.md-body h2 { font-size: 1.15em; }
+.md-body h3 { font-size: 1.06em; }
+.md-body h4 { font-size: 1em; color: #444; }
+.md-body ul, .md-body ol { margin: 6px 0; padding-left: 22px; }
+.md-body li { margin: 2px 0; }
+.md-body strong { font-weight: 600; }
+.md-body em { font-style: italic; }
+.md-body code { background: #f0f2f7; padding: 1px 5px; border-radius: 3px; font-family: "SFMono-Regular", Consolas, monospace; font-size: 0.92em; }
+.md-body pre { background: #f6f8fa; padding: 8px 10px; border-radius: 4px; overflow-x: auto; margin: 6px 0; }
+.md-body pre code { background: transparent; padding: 0; font-size: 0.88em; }
+.md-body blockquote { margin: 6px 0; padding: 2px 10px; border-left: 3px solid #d0d7de; color: #555; }
+.md-body hr { border: 0; border-top: 1px solid #eee; margin: 10px 0; }
+.md-body a { color: #2d6cdf; text-decoration: none; }
+.md-body a:hover { text-decoration: underline; }
+
+.ai-input-row { display: flex; gap: 6px; padding: 8px 12px; border-top: 1px solid #eee; background: #fff; flex: 0 0 auto; }
+.ai-input-row textarea { flex: 1; resize: none; height: 50px; padding: 6px 8px; border: 1px solid #ddd; border-radius: 4px; font-family: inherit; font-size: 13px; }
+.ai-input-row button { font-size: 13px; padding: 4px 14px; border: 1px solid #2d6cdf; background: #2d6cdf; color: #fff; border-radius: 4px; cursor: pointer; }
+.ai-input-row button:disabled { background: #aaa; border-color: #aaa; cursor: wait; }
 
 #viewer { flex: 1; background: #f0f0f3; overflow: auto; position: relative; }
 #viewer .placeholder { color: #999; text-align: center; padding: 60px 0; }

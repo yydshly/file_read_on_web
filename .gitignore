@@ -3,8 +3,13 @@ __pycache__/
 search_index.json
 search_index.json.tmp
 config.json
+state.json
 annotations.json
+*.bak
+*.tmp
 cache/
+logs/
+app_data/
 build/
 dist/
 *.spec

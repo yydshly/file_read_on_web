@@ -106,6 +106,7 @@ python -m pip install pyinstaller
 pyinstaller `
   --onedir `
   --name "资料浏览器" `
+  --icon "assets/app.ico" `
   --add-data "static;static" `
   server.py
 ```
@@ -117,6 +118,8 @@ dist/资料浏览器/
 ```
 
 可以将该目录压缩后分发给用户。
+
+打包版会优先把运行数据写入程序目录下的 `app_data/`，包括配置、收藏、缓存和搜索索引。迁移到新电脑时，连同 `app_data/` 一起复制即可；如果程序目录不可写，会自动改写到当前用户的本地应用数据目录。
 
 ## 打包 LibreOffice
 

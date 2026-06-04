@@ -21,11 +21,12 @@ Layout on disk:
 """
 from __future__ import annotations
 
-import json
 import threading
 import time
 from copy import deepcopy
 from pathlib import Path
+
+from safeio import atomic_write_json, read_json
 
 _DEFAULT_PALETTE = ["已看", "重点", "待复习"]
 
@@ -43,22 +44,14 @@ class AnnotationStore:
     # ---------- io ----------
 
     def _load(self) -> dict:
-        if self.path.exists():
-            try:
-                d = json.loads(self.path.read_text(encoding="utf-8"))
-                d.setdefault("roots", {})
-                return d
-            except Exception:
-                pass
-        return {"roots": {}}
+        d = read_json(self.path, default={"roots": {}})
+        if not isinstance(d, dict):
+            d = {"roots": {}}
+        d.setdefault("roots", {})
+        return d
 
     def _save_locked(self) -> None:
-        tmp = self.path.with_suffix(".json.tmp")
-        tmp.write_text(
-            json.dumps(self._data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-        tmp.replace(self.path)
+        atomic_write_json(self.path, self._data)
 
     # ---------- helpers ----------
 

@@ -12,16 +12,23 @@ import threading
 import time
 import webbrowser
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import annotations as annotations_mod
 import converter
 import search as search_mod
+from logging_setup import init_logging, get_logger
+from safeio import atomic_write_json, read_json
+
+import ai as ai_mod
+from ai import tasks as ai_tasks
+from ai import factory as ai_factory
+from ai.base import Message as AIMessage, CapabilityNotSupported, ProviderConfigError
 
 def _app_base_dir() -> Path:
     if getattr(sys, "frozen", False):
@@ -35,21 +42,54 @@ def _resource_base_dir() -> Path:
     return Path(__file__).parent.resolve()
 
 
-BASE_DIR = _app_base_dir()
+def _is_writable_dir(path: Path) -> bool:
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / ".write_test"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        return True
+    except Exception:
+        return False
+
+
+def _data_base_dir() -> Path:
+    app_dir = _app_base_dir()
+    if not getattr(sys, "frozen", False):
+        return app_dir
+
+    portable_dir = app_dir / "app_data"
+    if _is_writable_dir(portable_dir):
+        return portable_dir.resolve()
+
+    local_base = os.environ.get("LOCALAPPDATA") or str(Path.home())
+    fallback = Path(local_base) / "资料浏览器"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback.resolve()
+
+
+APP_DIR = _app_base_dir()
+DATA_DIR = _data_base_dir()
 RESOURCE_DIR = _resource_base_dir()
 STATIC_DIR = RESOURCE_DIR / "static"
-CACHE_DIR = BASE_DIR / "cache"
-CONFIG_PATH = BASE_DIR / "config.json"
-ANNO_PATH = BASE_DIR / "annotations.json"
-SEARCH_INDEX_PATH = BASE_DIR / "search_index.json"
+CACHE_DIR = DATA_DIR / "cache"
+TTS_CACHE_DIR = DATA_DIR / "cache" / "tts"   # hashed TTS audio bytes
+CONFIG_PATH = DATA_DIR / "config.json"   # user-editable: AI, preferences
+STATE_PATH  = DATA_DIR / "state.json"    # auto-managed: last_root, last_files, future runtime memory
+ANNO_PATH = DATA_DIR / "annotations.json"
+SEARCH_INDEX_PATH = DATA_DIR / "search_index.json"
 DEFAULT_ROOT_REL = "教学资料"
 
 anno_store = annotations_mod.AnnotationStore(ANNO_PATH)
 
 app = FastAPI()
 
-ROOT: Path = BASE_DIR
+ROOT: Path = APP_DIR
 PRECONVERT_ENABLED: bool = True
+
+# AI providers built from config on startup; either may be None if not configured.
+ai_text_provider = None     # type: ignore[var-annotated]
+ai_tts_provider = None      # type: ignore[var-annotated]
 
 # Background preconvert state
 _preconvert_task: Optional[asyncio.Task] = None
@@ -60,22 +100,75 @@ _preconvert_status: dict = {"running": False, "total": 0, "done": 0,
 
 # ---------- config persistence ----------
 
+# ---------- config (user-editable, read-only at runtime) ----------
+
 def _load_config() -> dict:
-    if CONFIG_PATH.exists():
-        try:
-            return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-    return {}
+    """User-editable settings (AI block, etc.). The server never writes to this."""
+    d = read_json(CONFIG_PATH, default={})
+    return d if isinstance(d, dict) else {}
 
 
-def _save_config(cfg: dict) -> None:
+# ---------- state (auto-managed runtime memory) ----------
+
+def _load_state() -> dict:
+    d = read_json(STATE_PATH, default={})
+    return d if isinstance(d, dict) else {}
+
+
+def _save_state(state: dict) -> None:
     try:
-        CONFIG_PATH.write_text(
-            json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        atomic_write_json(STATE_PATH, state)
     except Exception as e:
-        print(f"[browse] warn: failed to save config: {e}")
+        try:
+            get_logger("browse").warning("failed to save state: %s", e)
+        except Exception:
+            pass
+
+
+def _migrate_legacy_state() -> None:
+    """Older versions kept last_root / last_files inside config.json. If we
+    see them there (and state.json hasn't been initialised), move them out so
+    config.json becomes purely user-edited.
+
+    Migration is idempotent and runs only once (gated by state.json existence).
+    """
+    if STATE_PATH.exists():
+        return
+    cfg = _load_config()
+    legacy_keys = {"last_root", "last_files"}
+    moved = {k: cfg.pop(k) for k in list(cfg.keys()) if k in legacy_keys}
+    if not moved:
+        return
+
+    # 1. Persist the runtime state.
+    _save_state(moved)
+
+    # 2. Rewrite config.json without the migrated keys so the user sees a
+    #    clean file. Their other keys (ai, future preferences) are kept.
+    #    If config.json ends up empty, write a hint pointing at the example.
+    if not cfg:
+        cfg = {
+            "_doc": (
+                "本文件用于用户偏好（AI 等）。运行时记忆（上次目录、上次文件）"
+                "在同目录的 state.json 自动管理。配置模板见 config.example.json。"
+            )
+        }
+    try:
+        atomic_write_json(CONFIG_PATH, cfg)
+    except Exception as e:
+        try:
+            get_logger("browse").warning(
+                "migration: 无法回写 config.json，旧字段仍残留: %s", e
+            )
+        except Exception:
+            pass
+
+    try:
+        get_logger("browse").info(
+            "迁移：last_root / last_files 已从 config.json 移到 state.json"
+        )
+    except Exception:
+        pass
 
 
 def _root_key(root: Path) -> str:
@@ -83,22 +176,22 @@ def _root_key(root: Path) -> str:
 
 
 def _get_last_file(root: Path) -> Optional[str]:
-    cfg = _load_config()
-    return (cfg.get("last_files") or {}).get(_root_key(root))
+    state = _load_state()
+    return (state.get("last_files") or {}).get(_root_key(root))
 
 
 def _set_last_file(root: Path, rel: str) -> None:
-    cfg = _load_config()
-    last_files = cfg.setdefault("last_files", {})
+    state = _load_state()
+    last_files = state.setdefault("last_files", {})
     last_files[_root_key(root)] = rel
-    cfg["last_root"] = _root_key(root)
-    _save_config(cfg)
+    state["last_root"] = _root_key(root)
+    _save_state(state)
 
 
 def _set_last_root(root: Path) -> None:
-    cfg = _load_config()
-    cfg["last_root"] = _root_key(root)
-    _save_config(cfg)
+    state = _load_state()
+    state["last_root"] = _root_key(root)
+    _save_state(state)
 
 
 # ---------- path safety ----------
@@ -284,22 +377,35 @@ def _stop_background_tasks():
 
 
 def _warm_office_candidates(root: Path, limit: int = 2) -> list[Path]:
-    files: list[Path] = []
-    last = _get_last_file(root)
+    """Return the next ``limit`` *office* files immediately after the user's
+    last-opened file. The anchor file can be ANY type (PDF, MD, office…),
+    so we scan all files in sorted order and look for office files coming
+    after the anchor's position.
+    """
+    all_files: list[Path] = []
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in _SKIP_NAMES]
         for name in sorted(filenames, key=str.lower):
             if name.startswith("."):
                 continue
-            p = Path(dirpath) / name
-            if p.suffix.lower() in converter.OFFICE_EXTS:
-                files.append(p)
+            all_files.append(Path(dirpath) / name)
+
+    last = _get_last_file(root)
+    start = 0
     if last:
         last_path = (root / last).resolve()
-        for i, p in enumerate(files):
+        for i, p in enumerate(all_files):
             if p.resolve() == last_path:
-                return files[i + 1:i + 1 + limit]
-    return files[:limit]
+                start = i + 1
+                break
+
+    result: list[Path] = []
+    for p in all_files[start:]:
+        if p.suffix.lower() in converter.OFFICE_EXTS:
+            result.append(p)
+            if len(result) >= limit:
+                break
+    return result
 
 
 async def _warm_office_after_tree(root: Path):
@@ -318,11 +424,20 @@ async def _warm_office_after_tree(root: Path):
 
 
 def _start_warm_after_tree(root: Path):
+    """Initial warm kicked once after /api/tree is loaded for this root."""
     global _background_root
     if _background_root == root:
         return
     _background_root = root
+    _restart_warm(root)
+
+
+def _restart_warm(root: Path):
+    """Re-spawn the warm task. Used after each /api/file so the next 2
+    office files (relative to the user's *current* position) get preconverted."""
     global _warm_task
+    if root != ROOT:
+        return
     if _warm_task and not _warm_task.done():
         _warm_task.cancel()
     _warm_task = asyncio.create_task(_warm_office_after_tree(root))
@@ -392,23 +507,33 @@ async def api_file(path: str = Query(...), remember: int = 1, force: int = 0):
         _set_last_file(ROOT, path)
 
     kind = converter.classify(src)
+    response: Response
     if kind == "pdf":
-        return FileResponse(src, media_type="application/pdf")
-    if kind == "office":
+        response = FileResponse(src, media_type="application/pdf")
+    elif kind == "office":
         _cancel_warm_task()
         try:
             pdf = await converter.office_to_pdf(src, CACHE_DIR, force=bool(force))
         except RuntimeError as e:
             return JSONResponse({"error": "convert_failed", "message": str(e)}, status_code=500)
-        return FileResponse(pdf, media_type="application/pdf")
-    if kind == "markdown":
-        return HTMLResponse(converter.render_markdown(src, ROOT))
-    if kind == "text":
-        return HTMLResponse(converter.render_text(src))
-    if kind == "image":
-        return FileResponse(src, media_type=converter.image_mime(src))
-    return JSONResponse({"error": "unsupported", "name": src.name, "ext": src.suffix},
-                        status_code=415)
+        response = FileResponse(pdf, media_type="application/pdf")
+    elif kind == "markdown":
+        response = HTMLResponse(converter.render_markdown(src, ROOT))
+    elif kind == "text":
+        response = HTMLResponse(converter.render_text(src))
+    elif kind == "image":
+        response = FileResponse(src, media_type=converter.image_mime(src))
+    else:
+        return JSONResponse({"error": "unsupported", "name": src.name, "ext": src.suffix},
+                            status_code=415)
+
+    # After the user has moved to a new file, restart prewarm so the next
+    # 2 office files (relative to the new position) get queued in background.
+    # last_file has already been updated above when remember=1.
+    if remember and PRECONVERT_ENABLED:
+        _restart_warm(ROOT)
+
+    return response
 
 
 @app.get("/api/raw")
@@ -436,9 +561,47 @@ def api_cache_clear():
     return {"ok": True, "removed": removed, "skipped": skipped}
 
 
+def _dir_stats(d: Path, glob: str = "*") -> dict:
+    if not d.exists():
+        return {"files": 0, "bytes": 0}
+    files = [f for f in d.glob(glob) if f.is_file()]
+    return {"files": len(files), "bytes": sum(f.stat().st_size for f in files)}
+
+
 @app.get("/api/cache/stats")
 def api_cache_stats():
-    return converter.cache_stats(CACHE_DIR)
+    """Unified view of every on-disk cache the app maintains."""
+    pdf = converter.cache_stats(CACHE_DIR)
+    tts = _dir_stats(TTS_CACHE_DIR, "*.audio")
+    idx = {
+        "files": SEARCH_INDEX_PATH.exists() and 1 or 0,
+        "bytes": SEARCH_INDEX_PATH.stat().st_size if SEARCH_INDEX_PATH.exists() else 0,
+    }
+    logs = _dir_stats(DATA_DIR / "logs")
+    return {
+        "office_pdf": {
+            **pdf,
+            "limit_bytes": 2 * 1024 * 1024 * 1024,
+            "max_age_days": 30,
+        },
+        "tts_audio": {
+            **tts,
+            "limit_bytes": TTS_CACHE_MAX_BYTES,
+            "max_age_days": TTS_CACHE_MAX_AGE_DAYS,
+        },
+        "search_index": idx,
+        "logs": logs,
+        "total_bytes": pdf["bytes"] + tts["bytes"] + idx["bytes"] + logs["bytes"],
+    }
+
+
+@app.post("/api/cache/cleanup")
+def api_cache_cleanup():
+    """Run cleanup on every cache (LRU + age)."""
+    return {
+        "office_pdf": converter.cleanup_cache(CACHE_DIR, max_age_days=30),
+        "tts_audio":  _tts_cleanup(),
+    }
 
 
 @app.get("/api/search")
@@ -466,11 +629,439 @@ def api_search_skipped():
     return {"skipped": search_mod.skipped_files()}
 
 
+@app.get("/api/search/scanned")
+def api_search_scanned():
+    """List PDFs we detected as scanned (image-only). These can't be searched
+    or fed to the AI text pipeline without OCR."""
+    return {"scanned": search_mod.scanned_files(ROOT)}
+
+
+# Thresholds for AI eligibility (kept in one place so tests/UI can fetch).
+_AI_TEXT_HARD_LIMIT_CHARS = 1_400_000   # ~500K tokens at avg 2.8 chars/token
+_AI_TEXT_SOFT_LIMIT_CHARS = 280_000     # ~100K tokens — above this we do summarize-first
+
+
+@app.get("/api/file/ai-eligibility")
+def api_file_ai_eligibility(path: str = Query(...)):
+    """Tell the UI whether AI features apply to this file and why not."""
+    src = _safe_resolve(path)
+    info = {
+        "path": path,
+        "supported": True,
+        "mode": "direct",   # direct | summarize_first | unsupported
+        "reasons": [],
+        "char_count": 0,
+        "is_scanned": False,
+    }
+    kind = converter.classify(src)
+    if kind == "image":
+        info["mode"] = "vision_required"
+        info["reasons"].append("图片需要 vision 能力（未启用时不可用）")
+        return info
+    if kind == "unsupported":
+        info["supported"] = False
+        info["mode"] = "unsupported"
+        info["reasons"].append(f"不支持的文件类型：{src.suffix}")
+        return info
+
+    if kind in ("pdf", "office", "markdown", "text"):
+        text = search_mod.get_indexed_text(src, CACHE_DIR)
+        info["char_count"] = len(text)
+        if kind == "pdf" and search_mod.is_scanned(src):
+            info["supported"] = False
+            info["is_scanned"] = True
+            info["mode"] = "unsupported"
+            info["reasons"].append(
+                "扫描版 PDF 没有文本层，无法用于 AI 整理 / 对话"
+                "（可点页面右上 🖼 用 vision 单页识别）"
+            )
+            return info
+        if not text.strip():
+            # Office files extract text from the converted PDF in cache.
+            # If the PDF isn't there yet, eligibility is still "supported"
+            # — the actual AI call will trigger conversion on demand.
+            if kind == "office":
+                info["mode"] = "needs_conversion"
+                info["reasons"].append(
+                    "首次使用时需要先转换为 PDF（首条 AI 请求会触发，约 3-15s）"
+                )
+                return info
+            info["supported"] = False
+            info["mode"] = "unsupported"
+            info["reasons"].append("尚未索引到任何文本内容（可能预转换/索引还没跑完）")
+            return info
+        if info["char_count"] > _AI_TEXT_HARD_LIMIT_CHARS:
+            info["supported"] = False
+            info["mode"] = "unsupported"
+            info["reasons"].append(
+                f"文档过大（{info['char_count']:,} 字符 > {_AI_TEXT_HARD_LIMIT_CHARS:,}），"
+                "RAG 切分能力在后续版本支持"
+            )
+            return info
+        if info["char_count"] > _AI_TEXT_SOFT_LIMIT_CHARS:
+            info["mode"] = "summarize_first"
+            info["reasons"].append(
+                f"文档较长（{info['char_count']:,} 字符），将先生成结构化摘要，"
+                "后续问答基于摘要 + 检索片段"
+            )
+    return info
+
+
 @app.post("/api/search/rebuild")
 def api_search_rebuild():
     search_mod.clear_cache()
     _start_prebuild()
     return {"ok": True}
+
+
+# ---------- AI ----------
+
+class AiChatBody(BaseModel):
+    path: str
+    question: str
+    history: list[dict] = []   # list of {role, content}
+    summarize_first: bool = False
+    stream: bool = True
+
+
+class AiSummarizeBody(BaseModel):
+    path: str
+    force: bool = False        # ignore cached ai_summary in annotations
+    stream: bool = True
+
+
+class AiTtsBody(BaseModel):
+    text: str
+    voice: str | None = None
+    speed: float = 1.0
+
+
+def _ai_require_text() -> Any:
+    if ai_text_provider is None:
+        raise HTTPException(503, "AI 未启用：请在 config.json.ai 中配置 active provider")
+    return ai_text_provider
+
+
+def _ai_require_tts() -> Any:
+    if ai_tts_provider is None:
+        raise HTTPException(503, "AI TTS 未启用：请配置 ai.tts_provider 或让 active provider 支持 TTS")
+    return ai_tts_provider
+
+
+async def _ai_load_document(path: str) -> tuple[Path, str]:
+    """Resolve a file and return (Path, indexed text). Raises HTTPException
+    with a clear reason if AI features are unavailable for this file.
+
+    For office files this awaits ``office_to_pdf`` if needed — extraction
+    relies on the converted PDF being present in cache. Without this, AI
+    actions on a freshly opened (but not yet pre-converted) office file
+    would error with "尚未索引到文本".
+    """
+    src = _safe_resolve(path)
+    if src.is_dir():
+        raise HTTPException(400, "path is a directory")
+    kind = converter.classify(src)
+    if kind == "image":
+        raise HTTPException(400, "图片请走 vision 接口")
+    if kind == "unsupported":
+        raise HTTPException(400, f"不支持的文件类型：{src.suffix}")
+    if kind == "pdf" and search_mod.is_scanned(src):
+        raise HTTPException(
+            422,
+            "扫描版 PDF 无文本层，无法用于 AI 整理 / 对话。"
+            "可在预览页用 🖼 vision 单页识别。",
+        )
+
+    # Office: ensure the converted PDF exists before we try to read text from it.
+    # office_to_pdf is cached + locked, so this is a no-op on hit.
+    if kind == "office":
+        try:
+            await converter.office_to_pdf(src, CACHE_DIR)
+        except RuntimeError as e:
+            raise HTTPException(
+                422, f"该 office 文件无法转换为 PDF，AI 不可用：{e}"
+            )
+
+    text = search_mod.get_indexed_text(src, CACHE_DIR)
+    if not text.strip():
+        raise HTTPException(422, "文档尚未索引到文本（预转换 / 索引可能还没跑完）")
+    if len(text) > _AI_TEXT_HARD_LIMIT_CHARS:
+        raise HTTPException(
+            413,
+            f"文档过大（{len(text):,} 字符 > {_AI_TEXT_HARD_LIMIT_CHARS:,}）；"
+            "等待后续版本的 RAG 切分支持。",
+        )
+    return src, text
+
+
+def _mask_key(k: Optional[str]) -> str:
+    if not k:
+        return "(empty)"
+    k = str(k)
+    if len(k) <= 8:
+        return "*" * len(k)
+    return f"{k[:4]}…{k[-4:]} (len={len(k)})"
+
+
+@app.get("/api/ai/status")
+def api_ai_status():
+    """Status + masked credential preview so users can verify the running
+    process actually picked up their env vars."""
+    text_info = ai_text_provider.info() if ai_text_provider else None
+    tts_info = ai_tts_provider.info() if ai_tts_provider else None
+    if text_info and hasattr(ai_text_provider, "api_key"):
+        text_info["api_key_preview"] = _mask_key(ai_text_provider.api_key)
+        if hasattr(ai_text_provider, "group_id"):
+            text_info["group_id_preview"] = _mask_key(getattr(ai_text_provider, "group_id", ""))
+    if tts_info and hasattr(ai_tts_provider, "api_key"):
+        tts_info["api_key_preview"] = _mask_key(ai_tts_provider.api_key)
+        if hasattr(ai_tts_provider, "group_id"):
+            tts_info["group_id_preview"] = _mask_key(getattr(ai_tts_provider, "group_id", ""))
+        if hasattr(ai_tts_provider, "base_url"):
+            tts_info["base_url"] = getattr(ai_tts_provider, "base_url")
+    # Also surface which env vars the OS reports — useful when users wonder
+    # whether their `set` / `setx` actually reached this process.
+    env_seen = {}
+    for k in ("MINIMAX_API_KEY", "MINIMAX_GROUP_ID", "MIMO_API_KEY"):
+        env_seen[k] = _mask_key(os.environ.get(k))
+    return {
+        "text": text_info,
+        "tts": tts_info,
+        "providers_available": ai_factory.available_provider_types(),
+        "thresholds": {
+            "hard_limit_chars": _AI_TEXT_HARD_LIMIT_CHARS,
+            "soft_limit_chars": _AI_TEXT_SOFT_LIMIT_CHARS,
+        },
+        "env": env_seen,
+    }
+
+
+def _sse_stream(token_iter):
+    """Wrap an async iterator of text deltas in Server-Sent-Events frames."""
+    async def gen():
+        try:
+            async for delta in token_iter:
+                if not delta:
+                    continue
+                payload = json.dumps({"delta": delta}, ensure_ascii=False)
+                yield f"data: {payload}\n\n"
+            yield "data: [DONE]\n\n"
+        except Exception as e:
+            err = json.dumps({"error": str(e)}, ensure_ascii=False)
+            yield f"data: {err}\n\n"
+            yield "data: [DONE]\n\n"
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@app.post("/api/ai/summarize")
+async def api_ai_summarize(body: AiSummarizeBody):
+    provider = _ai_require_text()
+    src, text = await _ai_load_document(body.path)
+    rel = body.path
+    # Cached summary in annotations?
+    if not body.force:
+        anno = anno_store.get(ROOT, rel)
+        cached = (anno or {}).get("ai_summary")
+        if cached:
+            if body.stream:
+                async def replay():
+                    yield cached
+                return _sse_stream(replay())
+            return {"summary": cached, "cached": True}
+
+    async def run():
+        chunks = []
+        async for d in ai_tasks.summarize_document(provider, src.name, text):
+            chunks.append(d)
+            yield d
+        # persist after generation
+        full = "".join(chunks).strip()
+        if full:
+            anno_store.patch(ROOT, rel, {"ai_summary": full})
+
+    if body.stream:
+        return _sse_stream(run())
+
+    full = ""
+    async for d in run():
+        full += d
+    return {"summary": full, "cached": False}
+
+
+@app.post("/api/ai/chat")
+async def api_ai_chat(body: AiChatBody):
+    provider = _ai_require_text()
+    src, text = await _ai_load_document(body.path)
+    history = [AIMessage(role=m["role"], content=m["content"]) for m in body.history
+               if m.get("role") in {"user", "assistant"} and m.get("content")]
+
+    async def run():
+        async for d in ai_tasks.chat_about_document(
+            provider, src.name, text, history, body.question
+        ):
+            yield d
+
+    if body.stream:
+        return _sse_stream(run())
+
+    full = ""
+    async for d in run():
+        full += d
+    return {"answer": full}
+
+
+def _tts_cache_paths(provider_name: str, text: str, voice: str | None,
+                     speed: float) -> tuple[Path, Path]:
+    """Return (audio_path, mime_meta_path) for a given TTS request.
+    Key = sha1(provider|model-config|text|voice|speed)."""
+    import hashlib
+    h = hashlib.sha1()
+    h.update(provider_name.encode("utf-8"))
+    h.update(b"|")
+    h.update((voice or "").encode("utf-8"))
+    h.update(b"|")
+    h.update(f"{speed:.2f}".encode("ascii"))
+    h.update(b"|")
+    h.update(text.encode("utf-8"))
+    key = h.hexdigest()
+    return TTS_CACHE_DIR / f"{key}.audio", TTS_CACHE_DIR / f"{key}.mime"
+
+
+def _tts_cache_get(provider_name: str, text: str, voice: str | None,
+                   speed: float) -> Optional[tuple[bytes, str]]:
+    audio_p, mime_p = _tts_cache_paths(provider_name, text, voice, speed)
+    if not audio_p.exists() or not mime_p.exists():
+        return None
+    try:
+        mime = mime_p.read_text(encoding="utf-8").strip() or "audio/mpeg"
+        # touch for LRU
+        try: os.utime(audio_p, None)
+        except OSError: pass
+        return audio_p.read_bytes(), mime
+    except OSError:
+        return None
+
+
+def _tts_cache_put(provider_name: str, text: str, voice: str | None,
+                   speed: float, audio: bytes, mime: str) -> None:
+    try:
+        TTS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        audio_p, mime_p = _tts_cache_paths(provider_name, text, voice, speed)
+        audio_p.write_bytes(audio)
+        mime_p.write_text(mime, encoding="utf-8")
+    except OSError as e:
+        get_logger("ai").warning("TTS 缓存写入失败: %s", e)
+
+
+# Default thresholds — exposed so they can be tuned from a single place
+TTS_CACHE_MAX_AGE_DAYS = 60
+TTS_CACHE_MAX_BYTES    = 500 * 1024 * 1024   # 500 MB
+
+
+def _tts_cleanup(max_age_days: int = TTS_CACHE_MAX_AGE_DAYS,
+                 max_total_bytes: int = TTS_CACHE_MAX_BYTES) -> dict:
+    """Delete TTS cache entries older than max_age_days; then LRU-trim to size cap.
+
+    Each cached item is two files (``.audio`` + ``.mime``). They're managed as
+    a pair so partial deletion never leaves orphans.
+    """
+    if not TTS_CACHE_DIR.exists():
+        return {"removed": 0, "kept": 0, "bytes": 0}
+
+    now = time.time()
+    cutoff = now - max_age_days * 86400
+    entries = []   # [(atime, size, audio_path, mime_path)]
+    removed = 0
+
+    for audio_p in TTS_CACHE_DIR.glob("*.audio"):
+        mime_p = audio_p.with_suffix(".mime")
+        try:
+            st = audio_p.stat()
+        except OSError:
+            continue
+        atime = max(st.st_atime, st.st_mtime)
+        if atime < cutoff:
+            try:
+                audio_p.unlink(missing_ok=True)
+                mime_p.unlink(missing_ok=True)
+                removed += 1
+                continue
+            except OSError:
+                pass
+        entries.append((atime, st.st_size, audio_p, mime_p))
+
+    # size-cap pass (oldest atime first)
+    entries.sort()
+    total = sum(e[1] for e in entries)
+    i = 0
+    while total > max_total_bytes and i < len(entries):
+        _, size, audio_p, mime_p = entries[i]
+        try:
+            audio_p.unlink(missing_ok=True)
+            mime_p.unlink(missing_ok=True)
+            total -= size
+            removed += 1
+        except OSError:
+            pass
+        i += 1
+
+    kept = max(len(entries) - i, 0)
+    return {"removed": removed, "kept": kept, "bytes": total}
+
+
+@app.post("/api/ai/tts")
+async def api_ai_tts(body: AiTtsBody):
+    provider = _ai_require_tts()
+    if not body.text.strip():
+        raise HTTPException(400, "text 不能为空")
+
+    # 1) Try local cache first — same text/voice/speed = same audio.
+    hit = _tts_cache_get(provider.name, body.text, body.voice, body.speed)
+    if hit is not None:
+        audio, mime = hit
+        return Response(content=audio, media_type=mime,
+                        headers={"X-TTS-Cache": "hit"})
+
+    # 2) Cache miss — call the provider.
+    try:
+        result = await provider.tts(body.text, voice=body.voice, speed=body.speed)
+    except CapabilityNotSupported as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        get_logger("ai").exception("TTS 失败")
+        raise HTTPException(502, f"TTS 失败：{e}")
+
+    # Providers return (bytes, mime). Tolerate old bytes-only too.
+    if isinstance(result, tuple) and len(result) == 2:
+        audio, mime = result
+    else:
+        audio, mime = result, "audio/mpeg"
+
+    # 3) Save to disk for next time.
+    _tts_cache_put(provider.name, body.text, body.voice, body.speed, audio, mime)
+
+    return Response(content=audio, media_type=mime,
+                    headers={"X-TTS-Cache": "miss"})
+
+
+@app.get("/api/ai/tts/stats")
+def api_ai_tts_stats():
+    """Kept for backwards-compat; the unified /api/cache/stats is preferred."""
+    return _dir_stats(TTS_CACHE_DIR, "*.audio")
+
+
+@app.post("/api/ai/tts/clear")
+def api_ai_tts_clear():
+    if not TTS_CACHE_DIR.exists():
+        return {"removed": 0}
+    n = 0
+    for f in TTS_CACHE_DIR.iterdir():
+        try:
+            f.unlink()
+            n += 1
+        except OSError:
+            pass
+    return {"removed": n}
 
 
 # ---------- annotations ----------
@@ -530,7 +1121,7 @@ def api_root_set(body: RootBody):
     global ROOT
     new_path = Path(body.path).expanduser()
     if not new_path.is_absolute():
-        new_path = (BASE_DIR / new_path).resolve()
+        new_path = (APP_DIR / new_path).resolve()
     new_path = new_path.resolve()
     if not new_path.exists() or not new_path.is_dir():
         raise HTTPException(400, f"not a directory: {new_path}")
@@ -579,7 +1170,7 @@ def api_pick_folder():
         root.withdraw()
         root.attributes("-topmost", True)
         try:
-            initial = str(ROOT) if ROOT.exists() else str(BASE_DIR)
+            initial = str(ROOT) if ROOT.exists() else str(APP_DIR)
             chosen = filedialog.askdirectory(
                 title="选择资料根目录", initialdir=initial, parent=root
             )
@@ -619,19 +1210,19 @@ def _open_browser_later(url: str, delay: float = 1.0):
 
 
 def _resolve_initial_root(cli_root: Optional[str]) -> Path:
-    """Priority: explicit CLI > saved config last_root > default folder under BASE_DIR."""
+    """Priority: explicit CLI > saved state last_root > default folder under APP_DIR."""
     # explicit CLI takes precedence
     if cli_root:
         p = Path(cli_root)
         if not p.is_absolute():
-            p = (BASE_DIR / p).resolve()
+            p = (APP_DIR / p).resolve()
         if p.exists() and p.is_dir():
             return p.resolve()
         print(f"[browse] warn: --root '{p}' not found, falling back")
 
-    # saved config
-    cfg = _load_config()
-    saved = cfg.get("last_root")
+    # saved state
+    state = _load_state()
+    saved = state.get("last_root")
     if saved:
         p = Path(saved)
         if p.exists() and p.is_dir():
@@ -639,10 +1230,10 @@ def _resolve_initial_root(cli_root: Optional[str]) -> Path:
         print(f"[browse] warn: saved last_root '{saved}' no longer exists, falling back")
 
     # default
-    p = (BASE_DIR / DEFAULT_ROOT_REL).resolve()
+    p = (APP_DIR / DEFAULT_ROOT_REL).resolve()
     if p.exists() and p.is_dir():
         return p
-    return BASE_DIR
+    return APP_DIR
 
 
 def main():
@@ -655,24 +1246,71 @@ def main():
                         help="disable background pre-conversion of office files")
     args = parser.parse_args()
 
+    # Migrate legacy last_root/last_files (used to live in config.json) into state.json
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _migrate_legacy_state()
+
     global ROOT, PRECONVERT_ENABLED
     ROOT = _resolve_initial_root(args.root)
     PRECONVERT_ENABLED = not args.no_preconvert
     _set_last_root(ROOT)
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
+    log_dir = init_logging(DATA_DIR)
+    log = get_logger("browse")
+
     cleaned = converter.cleanup_cache(CACHE_DIR, max_age_days=30)
     if cleaned["removed"]:
-        print(f"[browse] cache: 删除 {cleaned['removed']} 项过期，保留 {cleaned['kept']} 项 "
-              f"({cleaned['bytes']/1024/1024:.1f} MB)")
+        log.info("PDF cache: 删除 %d 项过期，保留 %d 项 (%.1f MB)",
+                 cleaned["removed"], cleaned["kept"], cleaned["bytes"]/1024/1024)
+    tts_cleaned = _tts_cleanup()
+    if tts_cleaned["removed"]:
+        log.info("TTS cache: 删除 %d 项过期，保留 %d 项 (%.1f MB)",
+                 tts_cleaned["removed"], tts_cleaned["kept"], tts_cleaned["bytes"]/1024/1024)
 
     soffice = converter.find_soffice()
-    print(f"[browse] root: {ROOT}")
-    print(f"[browse] LibreOffice: {soffice or '未检测到（doc/docx/xlsx 等格式将无法预览，请安装 LibreOffice）'}")
-    print(f"[browse] open http://{args.host}:{args.port}/")
+    log.info("root: %s", ROOT)
+    log.info("data: %s", DATA_DIR)
+    log.info("logs: %s", log_dir)
+    log.info("LibreOffice: %s",
+             soffice or "未检测到（doc/docx/xlsx 等格式将无法预览，请安装 LibreOffice）")
+    log.info("open http://%s:%d/", args.host, args.port)
+
+    # AI providers (best-effort: missing config just disables AI features)
+    global ai_text_provider, ai_tts_provider
+    cfg = _load_config()
+    ai_cfg = cfg.get("ai") or {}
+    try:
+        ai_text_provider = ai_factory.make_active(ai_cfg)
+    except Exception as e:
+        log.warning("AI text provider 初始化失败: %s", e)
+        ai_text_provider = None
+    try:
+        ai_tts_provider = ai_factory.make_tts(ai_cfg)
+    except Exception as e:
+        log.warning("AI tts provider 初始化失败: %s", e)
+        ai_tts_provider = None
+    log.info("AI text: %s",
+             ai_text_provider.info() if ai_text_provider else "未配置")
+    log.info("AI tts:  %s",
+             ai_tts_provider.info() if ai_tts_provider else "未配置")
 
     if not args.no_browser:
         _open_browser_later(f"http://{args.host}:{args.port}/")
+
+    # Ensure orphaned soffice subprocesses are killed on exit
+    import atexit, signal
+    def _on_exit(*_a):
+        killed = converter.kill_orphan_soffice()
+        if killed:
+            log.warning("退出时清理 %d 个残留 soffice 进程", killed)
+    atexit.register(_on_exit)
+    try:
+        signal.signal(signal.SIGINT, lambda *_: (_on_exit(), sys.exit(0)))
+        signal.signal(signal.SIGTERM, lambda *_: (_on_exit(), sys.exit(0)))
+    except (ValueError, AttributeError):
+        # signal.signal may fail in non-main thread or on some platforms
+        pass
 
     import uvicorn
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
