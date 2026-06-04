@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import webbrowser
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Optional
 
@@ -163,7 +164,7 @@ def _flush_state(force: bool = False) -> None:
     with _state_lock:
         if _state_cache is None or (not _state_dirty and not force):
             return
-        snapshot = dict(_state_cache)
+        snapshot = deepcopy(_state_cache)
         _state_dirty = False
     try:
         atomic_write_json(STATE_PATH, snapshot)
@@ -613,13 +614,9 @@ def _ensure_search_index_loaded() -> int:
 
 @app.on_event("startup")
 async def _on_startup():
+    # Startup prebuild/preconvert is intentionally disabled.
+    # Index loading is performed lazily in _ensure_search_index_loaded().
     return
-    # restore index from disk first (instant for already-known files)
-    loaded = search_mod.load_index(SEARCH_INDEX_PATH)
-    if loaded:
-        print(f"[search] 从磁盘恢复 {loaded} 个文件的索引")
-    _start_preconvert()
-    _start_prebuild()
 
 
 @app.on_event("shutdown")
@@ -770,6 +767,21 @@ def api_cache_cleanup():
     }
 
 
+_SEARCH_INDEX_SAVE_MIN_INTERVAL = 10.0
+_last_search_index_save_at = 0.0
+_search_index_save_lock = threading.Lock()
+
+
+def _maybe_save_search_index() -> bool:
+    global _last_search_index_save_at
+    now = time.time()
+    with _search_index_save_lock:
+        if now - _last_search_index_save_at < _SEARCH_INDEX_SAVE_MIN_INTERVAL:
+            return False
+        _last_search_index_save_at = now
+    return search_mod.save_index(SEARCH_INDEX_PATH)
+
+
 @app.get("/api/search")
 async def api_search(q: str = Query(...), limit: int = 50):
     """Full-text substring search. CPU-bound — runs in default executor."""
@@ -779,11 +791,11 @@ async def api_search(q: str = Query(...), limit: int = 50):
     results = await loop.run_in_executor(
         None, search_mod.search, root, CACHE_DIR, q, limit
     )
-    await loop.run_in_executor(None, search_mod.save_index, SEARCH_INDEX_PATH)
+    saved = await loop.run_in_executor(None, _maybe_save_search_index)
     return {"query": q, "count": len(results), "results": results,
             "index": search_mod.index_stats(),
             "prebuild": search_mod.prebuild_status(),
-            "loaded": loaded}
+            "loaded": loaded, "index_saved": saved}
 
 
 @app.get("/api/search/status")
@@ -892,7 +904,7 @@ async def api_file_ai_eligibility(path: str = Query(...)):
             info["mode"] = "unsupported"
             info["reasons"].append(
                 f"文档过大（{info['char_count']:,} 字符 > {_AI_TEXT_HARD_LIMIT_CHARS:,}），"
-                "RAG 切分能力在后续版本支持"
+                "未来可作为 RAG/切分检索能力评估"
             )
             return info
         if info["char_count"] > _AI_TEXT_SOFT_LIMIT_CHARS:
@@ -1007,7 +1019,7 @@ async def _ai_load_document(path: str) -> tuple[Path, str]:
         raise HTTPException(
             413,
             f"文档过大（{len(text):,} 字符 > {_AI_TEXT_HARD_LIMIT_CHARS:,}）；"
-            "等待后续版本的 RAG 切分支持。",
+            "未来可作为 RAG/切分检索能力评估。",
         )
     return src, text
 
@@ -1104,7 +1116,7 @@ async def api_ai_summarize(body: AiSummarizeBody):
         full = "".join(chunks).strip()
         if full:
             yield {"stage": "保存生成结果"}
-            anno_store.patch(root, rel, {"ai_summary": full})
+            await _anno_patch_async(root, rel, {"ai_summary": full})
 
     if body.stream:
         return _sse_stream(run_stream())
@@ -1122,7 +1134,7 @@ async def api_ai_summarize(body: AiSummarizeBody):
     async for d in ai_tasks.summarize_document(provider, src.name, text):
         full += d
     if full.strip():
-        anno_store.patch(root, rel, {"ai_summary": full.strip()})
+        await _anno_patch_async(root, rel, {"ai_summary": full.strip()})
     return {"summary": full, "cached": False}
 
 
@@ -1184,7 +1196,7 @@ def _tts_cache_get(provider_name: str, text: str, voice: str | None,
         mime = mime_p.read_text(encoding="utf-8").strip() or "audio/mpeg"
         # touch for LRU
         try: os.utime(audio_p, None)
-        except OSError: pass
+        except OSError: get_logger("ai").debug("TTS 缓存 LRU touch 失败: %s", audio_p)
         return audio_p.read_bytes(), mime
     except OSError:
         return None
@@ -1234,8 +1246,8 @@ def _tts_cleanup(max_age_days: int = TTS_CACHE_MAX_AGE_DAYS,
                 mime_p.unlink(missing_ok=True)
                 removed += 1
                 continue
-            except OSError:
-                pass
+            except OSError as e:
+                get_logger("ai").debug("TTS 缓存清理删除旧文件失败: %s", e)
         entries.append((atime, st.st_size, audio_p, mime_p))
 
     # size-cap pass (oldest atime first)
@@ -1249,8 +1261,8 @@ def _tts_cleanup(max_age_days: int = TTS_CACHE_MAX_AGE_DAYS,
             mime_p.unlink(missing_ok=True)
             total -= size
             removed += 1
-        except OSError:
-            pass
+        except OSError as e:
+            get_logger("ai").debug("TTS 缓存清理 size-cap 删除失败: %s", e)
         i += 1
 
     kept = max(len(entries) - i, 0)
@@ -1333,12 +1345,22 @@ def api_ai_tts_clear():
         try:
             f.unlink()
             n += 1
-        except OSError:
-            pass
+        except OSError as e:
+            get_logger("ai").debug("TTS 缓存清空删除文件失败: %s", e)
     return {"removed": n}
 
 
 # ---------- annotations ----------
+
+
+async def _anno_patch_async(root: Path, rel_path: str, partial: dict) -> dict:
+    """Offload annotation JSON write from async handlers to avoid blocking the event loop."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        lambda: anno_store.patch(root, rel_path, partial),
+    )
+
 
 @app.get("/api/anno/all")
 def api_anno_all():
@@ -1363,7 +1385,7 @@ async def api_anno_patch(request: Request, path: str = Query(...)):
         raise HTTPException(400, "invalid JSON body")
     if not isinstance(body, dict):
         raise HTTPException(400, "body must be a JSON object")
-    return anno_store.patch(_require_root(), path, body)
+    return await _anno_patch_async(_require_root(), path, body)
 
 
 class TagPaletteBody(BaseModel):
