@@ -27,6 +27,13 @@ import search as search_mod
 from logging_setup import init_logging, get_logger
 from safeio import atomic_write_json, read_json
 
+try:
+    from tray_controller import TrayController
+    _TRAY_AVAILABLE = True
+except Exception:
+    _TRAY_AVAILABLE = False
+    TrayController = None  # type: ignore[assignment]
+
 import ai as ai_mod
 from ai import tasks as ai_tasks
 from ai import factory as ai_factory
@@ -1279,12 +1286,7 @@ def api_shutdown(request: Request):
     client = request.client
     if client is None or client.host not in ("127.0.0.1", "localhost", "::1"):
         raise HTTPException(403, "仅允许本地访问")
-    log = get_logger("browse")
-    log.info("收到退出程序请求 from %s", client.host)
-    killed = converter.kill_orphan_soffice()
-    if killed:
-        log.info("退出时清理 %d 个残留 soffice 进程", killed)
-    _delayed_exit(0.6)
+    _request_app_shutdown(reason=f"api:{client.host}")
     return {"ok": True, "message": "程序正在退出"}
 
 
@@ -1447,6 +1449,33 @@ def _delayed_exit(delay: float = 0.6):
     t.start()
 
 
+# Global tray controller reference — set during main()
+_tray_controller: Optional["TrayController"] = None  # type: ignore[valid-type]
+
+
+def _request_app_shutdown(reason: str = "api") -> None:
+    """Shared shutdown logic for both /api/shutdown and tray exit.
+
+    Cleans up LibreOffice processes, logs the exit reason, and exits.
+    """
+    log = get_logger("browse")
+    log.info("收到退出程序请求 (reason=%s)", reason)
+    killed = converter.kill_orphan_soffice()
+    if killed:
+        log.info("退出时清理 %d 个残留 soffice 进程", killed)
+
+    # Stop the tray icon if running
+    global _tray_controller
+    if _tray_controller is not None:
+        try:
+            _tray_controller.stop()
+        except Exception:
+            pass
+        _tray_controller = None
+
+    _delayed_exit(0.6)
+
+
 def main():
     _ensure_stdio_for_noconsole()
     parser = argparse.ArgumentParser()
@@ -1458,6 +1487,10 @@ def main():
                         help="disable background pre-conversion of office files")
     parser.add_argument("--force-server", action="store_true",
                         help="start server even if another instance is already running")
+    parser.add_argument("--tray", action="store_true",
+                        help="force-enable system tray (useful in dev mode)")
+    parser.add_argument("--no-tray", action="store_true",
+                        help="disable system tray")
     args = parser.parse_args()
 
     # Migrate legacy last_root/last_files (used to live in config.json) into state.json
@@ -1476,6 +1509,11 @@ def main():
             if not opened:
                 log.warning("请手动访问: %s", url)
         return
+
+    # Determine whether to enable the tray icon.
+    # Default: enabled in packaged (frozen) mode, disabled in dev mode.
+    tray_enabled = (getattr(sys, "frozen", False) or args.tray) and not args.no_tray
+    tray_started = False
 
     global ROOT, PRECONVERT_ENABLED
     ROOT = _resolve_initial_root(args.root)
@@ -1530,12 +1568,40 @@ def main():
         health_url = f"http://{args.host}:{args.port}/api/health"
         _open_browser_when_ready(url, health_url)
 
+    # Start system tray (after duplicate check, before uvicorn)
+    log.info("tray_enabled: %s", tray_enabled)
+    if tray_enabled and _TRAY_AVAILABLE and TrayController is not None:
+        url = f"http://{args.host}:{args.port}/"
+        log_file = log_dir / "app.log"
+        icon_path = STATIC_DIR / "favicon.ico"
+        tc = TrayController(
+            app_name=APP_NAME,
+            url=url,
+            data_dir=DATA_DIR,
+            log_file=log_file,
+            icon_path=icon_path,
+            open_url=_open_app_url,
+            shutdown_callback=_request_app_shutdown,
+        )
+        tray_started = tc.start()
+        log.info("tray_started: %s", tray_started)
+        if tray_started:
+            global _tray_controller
+            _tray_controller = tc
+    elif tray_enabled:
+        log.warning("tray_enabled but dependencies unavailable (pystray/Pillow missing)")
+
     # Ensure orphaned soffice subprocesses are killed on exit
     import atexit, signal
     def _on_exit(*_a):
         killed = converter.kill_orphan_soffice()
         if killed:
             log.warning("退出时清理 %d 个残留 soffice 进程", killed)
+        if _tray_controller is not None:
+            try:
+                _tray_controller.stop()
+            except Exception:
+                pass
     atexit.register(_on_exit)
     try:
         signal.signal(signal.SIGINT, lambda *_: (_on_exit(), sys.exit(0)))

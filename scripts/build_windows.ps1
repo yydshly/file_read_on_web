@@ -87,6 +87,9 @@ $pyArgs = @(
     "--name", $internalName,
     "--icon", "assets/app.ico",
     "--add-data", "static;static",
+    "--hidden-import", "pystray._win32",
+    "--hidden-import", "PIL.Image",
+    "--hidden-import", "PIL.ImageDraw",
     "server.py"
 )
 
