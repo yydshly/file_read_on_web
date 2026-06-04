@@ -1462,10 +1462,11 @@ function _applyAiWidth() {
 _applyAiMode();
 _applyAiWidth();
 
-// HOTFIX-LOCAL-RESPONSIVENESS-V1 #5:
+// HOTFIX-LOCAL-RESPONSIVENESS-V1 #5 + bb4af627 follow-up #3:
 // Refuse to open the AI text panel on file types it can't help with so the
-// user doesn't waste a click typing then getting a 400. Images need vision
-// (not yet UI-wired); other types are flat-out unsupported by the text flow.
+// user doesn't waste a click typing then getting a 400. Images are
+// preview-only at the moment (Vision/OCR is out of scope for this product);
+// other types are flat-out unsupported by the text flow.
 function _aiFileKindFromPath(path) {
   if (!path) return null;
   const ext = ('.' + (path.split('.').pop() || '')).toLowerCase();
@@ -1489,8 +1490,8 @@ async function aiOpenPanel() {
   const kind = _aiFileKindFromPath(currentPath);
   if (kind === 'image') {
     alert(
-      '当前是图片。AI 对话/整理只接受文本类文档。\n\n' +
-      '图片需要 vision 单页识别能力，UI 暂未接入（后续会提供 🖼 识别本图 按钮）。'
+      '图片当前仅支持预览，暂不支持 AI 整理 / 问答。\n\n' +
+      '未来可作为 Vision/OCR 扩展能力评估。'
     );
     return;
   }

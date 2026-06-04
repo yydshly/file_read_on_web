@@ -248,11 +248,20 @@ def _root_key(root: Path) -> str:
 
 
 def _get_last_file(root: Path) -> Optional[str]:
-    """Read-only; the lock isn't strictly needed because dict.get under CPython
-    is atomic, but we take it briefly for consistency."""
+    """Read the cached last_file for ``root``.
+
+    bb4af627 follow-up #1: do NOT call _load_state() while holding
+    _state_lock — the prior version did, which would deadlock on the first
+    read because _load_state itself acquires _state_lock (a non-reentrant
+    threading.Lock). We now load outside the critical section (the same
+    pattern _set_last_file / _set_last_root already use) and the lock just
+    serialises the snapshot read.
+    """
+    if _state_cache is None:
+        _load_state()
     key = _root_key(root)
     with _state_lock:
-        state = _state_cache if _state_cache is not None else _load_state()
+        state = _state_cache if _state_cache is not None else {}
         return (state.get("last_files") or {}).get(key)
 
 
@@ -820,16 +829,18 @@ async def api_file_ai_eligibility(path: str = Query(...)):
     }
     kind = converter.classify(src)
     if kind == "image":
-        # HOTFIX-LOCAL-RESPONSIVENESS-V1 #5:
-        # Images go through vision, not text chat. The UI used to round-trip
-        # to /api/ai/chat for images and fail late. We now mark them
-        # unsupported here so the front-end can refuse the click with a
-        # clear message before bothering the user with an input box.
+        # HOTFIX-LOCAL-RESPONSIVENESS-V1 #5 + bb4af627 follow-up #3:
+        # Image files have no text content for the AI text flow. The UI
+        # used to round-trip to /api/ai/chat and fail late; we now mark
+        # them unsupported here so the front-end can refuse the click
+        # before bothering the user with an input box. The "mode" value
+        # is kept for compatibility but the user-facing message no longer
+        # promises a Vision/OCR UI affordance.
         info["supported"] = False
         info["mode"] = "vision_required"
         info["reasons"].append(
-            "AI 对话/整理只支持文本类文档。图片需要 vision 单页识别（当前 UI 未接入，"
-            "后续会提供 🖼 识别本图 按钮）"
+            "图片当前仅支持预览，暂不支持 AI 整理 / 问答。"
+            "未来可作为 Vision/OCR 扩展能力评估。"
         )
         return info
     if kind == "unsupported":
@@ -850,8 +861,8 @@ async def api_file_ai_eligibility(path: str = Query(...)):
             info["is_scanned"] = True
             info["mode"] = "unsupported"
             info["reasons"].append(
-                "扫描版 PDF 没有文本层，无法用于 AI 整理 / 对话"
-                "（可点页面右上 🖼 用 vision 单页识别）"
+                "扫描版 PDF 无文本层，当前仅支持预览，暂不支持 AI 整理 / 问答。"
+                "未来可作为 Vision/OCR 扩展能力评估。"
             )
             return info
         if not text.strip():
@@ -942,14 +953,18 @@ async def _ai_load_document(path: str) -> tuple[Path, str]:
         raise HTTPException(400, "path is a directory")
     kind = converter.classify(src)
     if kind == "image":
-        raise HTTPException(400, "图片请走 vision 接口")
+        raise HTTPException(
+            400,
+            "图片当前仅支持预览，暂不支持 AI 整理 / 问答。"
+            "未来可作为 Vision/OCR 扩展能力评估。",
+        )
     if kind == "unsupported":
         raise HTTPException(400, f"不支持的文件类型：{src.suffix}")
     if kind == "pdf" and search_mod.is_scanned(src):
         raise HTTPException(
             422,
-            "扫描版 PDF 无文本层，无法用于 AI 整理 / 对话。"
-            "可在预览页用 🖼 vision 单页识别。",
+            "扫描版 PDF 无文本层，当前仅支持预览，暂不支持 AI 整理 / 问答。"
+            "未来可作为 Vision/OCR 扩展能力评估。",
         )
 
     # Office: ensure the converted PDF exists before we try to read text from it.
@@ -1625,10 +1640,24 @@ _tray_controller: Optional["TrayController"] = None  # type: ignore[valid-type]
 def _request_app_shutdown(reason: str = "api") -> None:
     """Shared shutdown logic for both /api/shutdown and tray exit.
 
-    Cleans up LibreOffice processes, logs the exit reason, and exits.
+    Order of operations matters here:
+      1. Flush the debounced state buffer (bb4af627 follow-up #2) — the
+         500ms debounce timer might still be pending; without this the
+         user's most recent file click could be lost when os._exit fires.
+      2. Stop the tray + kill orphan soffice subprocesses.
+      3. Schedule the actual process exit.
     """
     log = get_logger("browse")
     log.info("收到退出程序请求 (reason=%s)", reason)
+
+    # 1) Force-flush in-memory state to disk BEFORE we start tearing things
+    #    down. Safe to call repeatedly — atexit handlers will no-op on the
+    #    re-entry since _state_dirty becomes False after a successful write.
+    try:
+        _flush_state(force=True)
+    except Exception:
+        log.exception("state flush during shutdown failed (continuing)")
+
     killed = converter.kill_orphan_soffice()
     if killed:
         log.info("退出时清理 %d 个残留 soffice 进程", killed)
