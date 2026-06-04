@@ -82,7 +82,7 @@ def _zip_directory(source_dir: Path, output_zip: Path) -> None:
                 continue
 
             # Target path inside zip: <top_level>/<relative_path>
-            arcname = str(top_level / rel)
+            arcname = f"{top_level}/{rel.as_posix()}"
             zf.write(file_path, arcname)
 
     print(f"  zip created: {output_zip} ({output_zip.stat().st_size:,} bytes)")

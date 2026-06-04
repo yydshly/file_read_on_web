@@ -22,7 +22,7 @@ RELEASE-ZIP-PACKAGE-V1
 - Entry point for release zip packaging
 - Calls `scripts/build_windows.ps1` to build `dist/资料浏览器/`
 - Reads `APP_VERSION` from `app_metadata.py` via Python
-- Stamps zip name with `file_browser-v<VERSION>-windows-<YYYYMMDD>.zip`
+- Stamps zip name with `资料浏览器-v<VERSION>-windows-<YYYYMMDD>.zip`
 - Calls `_package_zip.py` to create and verify the zip
 - Output dir: `release_packages/`
 
@@ -47,7 +47,7 @@ RELEASE-ZIP-PACKAGE-V1
 ### README update
 - Added "生成发布 zip" section with:
   - Command: `powershell -ExecutionPolicy Bypass -File scripts/package_release_zip.ps1`
-  - Output example: `release_packages/file_browser-v0.1.0-windows-YYYYMMDD.zip`
+  - Output example: `release_packages/资料浏览器-v0.1.0-windows-YYYYMMDD.zip`
   - Note that zip excludes runtime data, config.json, logs, cache
 
 ### .gitignore

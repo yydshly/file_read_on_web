@@ -2,10 +2,10 @@
 .SYNOPSIS
     Build and package the release zip for the file browser app.
 
-    1. Runs scripts/build_windows.ps1 to produce dist/file_browser/
+    1. Runs scripts/build_windows.ps1 to produce dist/资料浏览器/
     2. Reads APP_VERSION from app_metadata.py
     3. Stamps the zip with the current date (YYYYMMDD)
-    4. Produces release_packages/file_browser-v<VERSION>-windows-<DATE>.zip
+    4. Produces release_packages/资料浏览器-v<VERSION>-windows-<DATE>.zip
     5. Verifies the zip contents
 
 .EXAMPLE
@@ -39,7 +39,7 @@ Write-Host ("  App version: {0}" -f $AppVersion) -ForegroundColor Green
 # Step 3: Determine output paths
 $DateStamp = Get-Date -Format "yyyyMMdd"
 $OutDir = Join-Path $ProjectRoot "release_packages"
-$ZipName = ("file_browser-v{0}-windows-{1}.zip" -f $AppVersion, $DateStamp)
+$ZipName = ("资料浏览器-v{0}-windows-{1}.zip" -f $AppVersion, $DateStamp)
 $ZipPath = Join-Path $OutDir $ZipName
 
 Write-Host ("  Output: {0}" -f $OutDir) -ForegroundColor Green
