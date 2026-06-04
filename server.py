@@ -22,8 +22,10 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 import annotations as annotations_mod
+import app_metadata
 import converter
 import search as search_mod
+from app_metadata import APP_ID, APP_NAME, APP_VERSION, RELEASE_BASELINE
 from logging_setup import init_logging, get_logger
 from safeio import atomic_write_json, read_json
 
@@ -94,8 +96,6 @@ APP_DIR = _app_base_dir()
 DATA_DIR = _data_base_dir()
 RESOURCE_DIR = _resource_base_dir()
 STATIC_DIR = RESOURCE_DIR / "static"
-APP_ID = "file_read_on_web"
-APP_NAME = "资料浏览器"
 CACHE_DIR = DATA_DIR / "cache"
 TTS_CACHE_DIR = DATA_DIR / "cache" / "tts"   # hashed TTS audio bytes
 CONFIG_PATH = DATA_DIR / "config.json"   # user-editable: AI, preferences
@@ -1221,9 +1221,22 @@ def api_anno_palette(body: TagPaletteBody):
 @app.get("/api/health")
 def api_health():
     return {"ok": True, "app_id": APP_ID, "app_name": APP_NAME,
+            "version": APP_VERSION,
             "soffice": converter.find_soffice(),
             "root": str(ROOT) if _has_root() else None,
             "needs_root": not _has_root()}
+
+
+@app.get("/api/version")
+def api_version():
+    return {
+        "ok": True,
+        "app_id": APP_ID,
+        "app_name": APP_NAME,
+        "version": APP_VERSION,
+        "release_baseline": RELEASE_BASELINE,
+        "frozen": bool(getattr(sys, "frozen", False)),
+    }
 
 
 @app.get("/api/root")
@@ -1533,6 +1546,8 @@ def main():
 
     soffice = converter.find_soffice()
     log.info("程序启动: %s", APP_NAME)
+    log.info("version: %s", APP_VERSION)
+    log.info("release_baseline: %s", RELEASE_BASELINE)
     log.info("app_dir: %s", APP_DIR)
     log.info("data: %s", DATA_DIR)
     log.info("config: %s", CONFIG_PATH)

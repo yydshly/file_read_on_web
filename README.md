@@ -201,3 +201,5 @@ dist/资料浏览器/
 当前 Windows MVP 发布基线见：
 
 - [Release Baseline V1](docs/89-release-baseline-v1.md)
+
+当前版本：`0.1.0`

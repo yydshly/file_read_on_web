@@ -1,14 +1,17 @@
 # Release Baseline V1 — 资料浏览器 Windows MVP
 
 ```
-baseline_name:  Release Baseline V1
-product_name:    资料浏览器
-target_platform: Windows
-runtime_shape:   本地后台服务 + 浏览器 UI + 系统托盘
-branch:         main
-baseline_commit: 3f7bfc4
-date:           2026-06-04
+baseline_name:     Release Baseline V1
+app_version:       0.1.0
+product_name:      资料浏览器
+target_platform:   Windows
+runtime_shape:     本地后台服务 + 浏览器 UI + 系统托盘
+branch:           main
+baseline_commit:   445d793
+date:             2026-06-04
 ```
+
+> **版本说明：** 当前 Release Baseline V1 对应产品版本 `0.1.0`。后续发布包、日志、`/api/version` 均以 `app_metadata.py` 中的 `APP_VERSION` 为准。
 
 ---
 
