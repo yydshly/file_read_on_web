@@ -19,7 +19,7 @@ from fastapi import HTTPException
 
 import converter
 import search as search_mod
-from ai import factory as ai_factory
+from src.ai import factory as ai_factory
 
 AI_TEXT_HARD_LIMIT_CHARS = 1_400_000   # ~500K tokens at avg 2.8 chars/token
 AI_TEXT_SOFT_LIMIT_CHARS = 280_000     # ~100K tokens — above this we do summarize-first

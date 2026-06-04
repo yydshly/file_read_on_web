@@ -28,8 +28,8 @@ import search as search_mod
 from app_metadata import APP_ID, APP_NAME, APP_VERSION, RELEASE_BASELINE
 from logging_setup import init_logging, get_logger
 from safeio import atomic_write_json, read_json
-from runtime_state import RuntimeStateStore
-from tts_cache import TtsCache
+from src.backend.services.runtime_state import RuntimeStateStore
+from src.backend.services.tts_cache import TtsCache
 
 try:
     from tray_controller import TrayController
@@ -38,11 +38,10 @@ except Exception:
     _TRAY_AVAILABLE = False
     TrayController = None  # type: ignore[assignment]
 
-import ai as ai_mod
-from ai import tasks as ai_tasks
-from ai import factory as ai_factory
-from ai.base import Message as AIMessage, CapabilityNotSupported, ProviderConfigError
-from ai.service import AiDocumentService, build_ai_status
+from src.ai import tasks as ai_tasks
+from src.ai import factory as ai_factory
+from src.ai.base import Message as AIMessage, CapabilityNotSupported
+from src.backend.services.ai_document import AiDocumentService, build_ai_status
 
 def _ensure_stdio_for_noconsole() -> None:
     """PyInstaller --noconsole may set stdout/stderr to None.
