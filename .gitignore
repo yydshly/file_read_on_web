@@ -3,6 +3,7 @@ __pycache__/
 search_index.json
 search_index.json.tmp
 config.json
+release_packages/
 state.json
 annotations.json
 *.bak

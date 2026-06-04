@@ -153,6 +153,22 @@ dist/资料浏览器/
 
 **注意**：不要将真实的 `config.json`（包含 API key）打包发布。
 
+### 生成发布 zip
+
+生成含版本号的发布 zip 包（输出到 `release_packages/`）：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/package_release_zip.ps1
+```
+
+输出示例：
+
+```
+release_packages/资料浏览器-v0.1.0-windows-20260604.zip
+```
+
+zip 包内含 `资料浏览器.exe`、`_internal/`、`app_data/config.example.json`，不含真实 `config.json`、日志、缓存或用户运行数据。
+
 ### 开发模式 vs 正式模式
 
 | | 开发模式 | 正式打包 |
