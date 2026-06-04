@@ -84,7 +84,7 @@ anno_store = annotations_mod.AnnotationStore(ANNO_PATH)
 
 app = FastAPI()
 
-ROOT: Path = APP_DIR
+ROOT: Optional[Path] = None
 PRECONVERT_ENABLED: bool = True
 
 # AI providers built from config on startup; either may be None if not configured.
@@ -196,12 +196,23 @@ def _set_last_root(root: Path) -> None:
 
 # ---------- path safety ----------
 
+def _has_root() -> bool:
+    return ROOT is not None and ROOT.exists() and ROOT.is_dir()
+
+
+def _require_root() -> Path:
+    if not _has_root():
+        raise HTTPException(409, "请先选择资料目录")
+    return ROOT
+
+
 def _safe_resolve(rel: str) -> Path:
+    root = _require_root()
     if not rel:
         raise HTTPException(400, "path is required")
-    candidate = (ROOT / rel).resolve()
+    candidate = (root / rel).resolve()
     try:
-        candidate.relative_to(ROOT)
+        candidate.relative_to(root)
     except ValueError:
         raise HTTPException(403, "path escapes root")
     if not candidate.exists():
@@ -211,10 +222,34 @@ def _safe_resolve(rel: str) -> Path:
 
 # ---------- tree ----------
 
-_SKIP_NAMES = {"__pycache__", "node_modules", ".git", ".idea", ".vscode"}
+_SKIP_NAMES = {
+    "__pycache__", "node_modules", ".git", ".idea", ".vscode",
+    "build", "dist", "app_data", "_internal", "libreoffice", "LibreOffice",
+}
+
+
+def _skip_tree_entry(entry: Path) -> bool:
+    name = entry.name
+    if name.startswith(".") or name in _SKIP_NAMES:
+        return True
+    try:
+        resolved = entry.resolve()
+    except OSError:
+        return True
+    skip_roots = {
+        DATA_DIR.resolve(),
+        CACHE_DIR.resolve(),
+        STATIC_DIR.resolve(),
+        (APP_DIR / "app_data").resolve(),
+        (APP_DIR / "_internal").resolve(),
+        (APP_DIR / "libreoffice").resolve(),
+        (APP_DIR / "LibreOffice").resolve(),
+    }
+    return resolved in skip_roots
 
 
 def _build_tree(d: Path, recursive: bool = True) -> dict:
+    root = _require_root()
     children = []
     try:
         entries = sorted(
@@ -224,12 +259,10 @@ def _build_tree(d: Path, recursive: bool = True) -> dict:
     except PermissionError:
         entries = []
     for entry in entries:
+        if _skip_tree_entry(entry):
+            continue
         name = entry.name
-        if name.startswith(".") or name in _SKIP_NAMES:
-            continue
-        if entry.resolve() in {CACHE_DIR.resolve(), STATIC_DIR.resolve()}:
-            continue
-        rel = str(entry.relative_to(ROOT)).replace("\\", "/")
+        rel = str(entry.relative_to(root)).replace("\\", "/")
         if entry.is_dir():
             children.append({"name": name, "path": rel, "type": "dir",
                              "children": _build_tree(entry, recursive)["children"] if recursive else []})
@@ -249,16 +282,8 @@ def _iter_files_in_tree_order(d: Path):
     except (OSError, PermissionError):
         return
 
-    skip_roots = {CACHE_DIR.resolve(), STATIC_DIR.resolve()}
     for entry in entries:
-        name = entry.name
-        if name.startswith(".") or name in _SKIP_NAMES:
-            continue
-        try:
-            resolved = entry.resolve()
-        except OSError:
-            continue
-        if resolved in skip_roots:
+        if _skip_tree_entry(entry):
             continue
         if entry.is_dir():
             yield from _iter_files_in_tree_order(entry)
@@ -271,8 +296,7 @@ def _iter_files_in_tree_order(d: Path):
 def _scan_office_files(root: Path) -> list[Path]:
     """Recursively find all office files under root, skipping caches/hidden."""
     out: list[Path] = []
-    cache_resolved = CACHE_DIR.resolve()
-    static_resolved = STATIC_DIR.resolve()
+    skip_roots = {DATA_DIR.resolve(), CACHE_DIR.resolve(), STATIC_DIR.resolve()}
     for dirpath, dirnames, filenames in os.walk(root):
         # in-place prune
         dirnames[:] = [
@@ -280,7 +304,7 @@ def _scan_office_files(root: Path) -> list[Path]:
             if not d.startswith(".") and d not in _SKIP_NAMES
         ]
         # Avoid walking our own cache/static if root is project dir
-        if Path(dirpath).resolve() in {cache_resolved, static_resolved}:
+        if Path(dirpath).resolve() in skip_roots:
             dirnames[:] = []
             continue
         for name in filenames:
@@ -337,11 +361,11 @@ async def _preconvert_worker(root: Path):
 def _start_preconvert():
     """(Re)start the background preconvert task for current ROOT."""
     global _preconvert_task
-    if not PRECONVERT_ENABLED:
+    if not PRECONVERT_ENABLED or not _has_root():
         return
     if _preconvert_task and not _preconvert_task.done():
         _preconvert_task.cancel()
-    _preconvert_task = asyncio.create_task(_preconvert_worker(ROOT))
+    _preconvert_task = asyncio.create_task(_preconvert_worker(_require_root()))
 
 
 # Background search-index prebuild
@@ -385,9 +409,11 @@ async def _prebuild_worker(root: Path):
 
 def _start_prebuild():
     global _prebuild_task
+    if not _has_root():
+        return
     if _prebuild_task and not _prebuild_task.done():
         _prebuild_task.cancel()
-    _prebuild_task = asyncio.create_task(_prebuild_worker(ROOT))
+    _prebuild_task = asyncio.create_task(_prebuild_worker(_require_root()))
 
 
 def _stop_background_tasks():
@@ -471,6 +497,8 @@ def _cancel_warm_task():
 
 def _ensure_search_index_loaded() -> int:
     global _search_index_loaded_root
+    if not _has_root():
+        return 0
     if _search_index_loaded_root == ROOT:
         return 0
     loaded = search_mod.load_index(SEARCH_INDEX_PATH)
@@ -498,13 +526,18 @@ async def _on_shutdown():
 
 @app.get("/api/tree")
 async def api_tree(path: str = "", recursive: int = 1):
-    base = ROOT if not path else _safe_resolve(path)
+    if not _has_root():
+        if path:
+            raise HTTPException(409, "请先选择资料目录")
+        return {"name": "", "path": "", "type": "dir", "children": [], "needs_root": True}
+    root = _require_root()
+    base = root if not path else _safe_resolve(path)
     if not base.is_dir():
         raise HTTPException(400, "path must be a directory")
     loop = asyncio.get_running_loop()
     tree = await loop.run_in_executor(None, _build_tree, base, bool(recursive))
     if not path:
-        _start_warm_after_tree(ROOT)
+        _start_warm_after_tree(root)
     return tree
 
 
@@ -520,12 +553,13 @@ def api_preconvert_status():
 
 @app.get("/api/file")
 async def api_file(path: str = Query(...), remember: int = 1, force: int = 0):
+    root = _require_root()
     src = _safe_resolve(path)
     if src.is_dir():
         raise HTTPException(400, "path is a directory")
 
     if remember:
-        _set_last_file(ROOT, path)
+        _set_last_file(root, path)
 
     kind = converter.classify(src)
     response: Response
@@ -539,7 +573,7 @@ async def api_file(path: str = Query(...), remember: int = 1, force: int = 0):
             return JSONResponse({"error": "convert_failed", "message": str(e)}, status_code=500)
         response = FileResponse(pdf, media_type="application/pdf")
     elif kind == "markdown":
-        response = HTMLResponse(converter.render_markdown(src, ROOT))
+        response = HTMLResponse(converter.render_markdown(src, root))
     elif kind == "text":
         response = HTMLResponse(converter.render_text(src))
     elif kind == "image":
@@ -552,7 +586,7 @@ async def api_file(path: str = Query(...), remember: int = 1, force: int = 0):
     # 2 office files (relative to the new position) get queued in background.
     # last_file has already been updated above when remember=1.
     if remember and PRECONVERT_ENABLED:
-        _restart_warm(ROOT)
+        _restart_warm(root)
 
     return response
 
@@ -628,10 +662,11 @@ def api_cache_cleanup():
 @app.get("/api/search")
 async def api_search(q: str = Query(...), limit: int = 50):
     """Full-text substring search. CPU-bound — runs in default executor."""
+    root = _require_root()
     loop = asyncio.get_running_loop()
     loaded = await loop.run_in_executor(None, _ensure_search_index_loaded)
     results = await loop.run_in_executor(
-        None, search_mod.search, ROOT, CACHE_DIR, q, limit
+        None, search_mod.search, root, CACHE_DIR, q, limit
     )
     await loop.run_in_executor(None, search_mod.save_index, SEARCH_INDEX_PATH)
     return {"query": q, "count": len(results), "results": results,
@@ -642,11 +677,17 @@ async def api_search(q: str = Query(...), limit: int = 50):
 
 @app.get("/api/search/status")
 def api_search_status():
+    if not _has_root():
+        s = search_mod.prebuild_status()
+        s["needs_root"] = True
+        return s
     return search_mod.prebuild_status()
 
 
 @app.get("/api/search/skipped")
 def api_search_skipped():
+    if not _has_root():
+        return {"skipped": {}, "needs_root": True}
     return {"skipped": search_mod.skipped_files()}
 
 
@@ -654,7 +695,9 @@ def api_search_skipped():
 def api_search_scanned():
     """List PDFs we detected as scanned (image-only). These can't be searched
     or fed to the AI text pipeline without OCR."""
-    return {"scanned": search_mod.scanned_files(ROOT)}
+    if not _has_root():
+        return {"scanned": [], "needs_root": True}
+    return {"scanned": search_mod.scanned_files(_require_root())}
 
 
 # Thresholds for AI eligibility (kept in one place so tests/UI can fetch).
@@ -665,6 +708,7 @@ _AI_TEXT_SOFT_LIMIT_CHARS = 280_000     # ~100K tokens — above this we do summ
 @app.get("/api/file/ai-eligibility")
 def api_file_ai_eligibility(path: str = Query(...)):
     """Tell the UI whether AI features apply to this file and why not."""
+    _require_root()
     src = _safe_resolve(path)
     info = {
         "path": path,
@@ -730,6 +774,8 @@ def api_file_ai_eligibility(path: str = Query(...)):
 
 @app.post("/api/search/rebuild")
 def api_search_rebuild():
+    if not _has_root():
+        return {"ok": False, "needs_root": True, "detail": "请先选择资料目录"}
     search_mod.clear_cache()
     _start_prebuild()
     return {"ok": True}
@@ -892,11 +938,12 @@ async def api_ai_summarize(body: AiSummarizeBody):
     async def run_stream():
         yield {"stage": "准备文档"}
         src, text = await _ai_load_document(body.path)
+        root = _require_root()
         rel = body.path
 
         if not body.force:
             yield {"stage": "检查已生成摘要"}
-            anno = anno_store.get(ROOT, rel)
+            anno = anno_store.get(root, rel)
             cached = (anno or {}).get("ai_summary")
             if cached:
                 yield {"stage": "使用已生成摘要", "cached": True}
@@ -912,15 +959,16 @@ async def api_ai_summarize(body: AiSummarizeBody):
         full = "".join(chunks).strip()
         if full:
             yield {"stage": "保存生成结果"}
-            anno_store.patch(ROOT, rel, {"ai_summary": full})
+            anno_store.patch(root, rel, {"ai_summary": full})
 
     if body.stream:
         return _sse_stream(run_stream())
 
     src, text = await _ai_load_document(body.path)
+    root = _require_root()
     rel = body.path
     if not body.force:
-        anno = anno_store.get(ROOT, rel)
+        anno = anno_store.get(root, rel)
         cached = (anno or {}).get("ai_summary")
         if cached:
             return {"summary": cached, "cached": True}
@@ -929,7 +977,7 @@ async def api_ai_summarize(body: AiSummarizeBody):
     async for d in ai_tasks.summarize_document(provider, src.name, text):
         full += d
     if full.strip():
-        anno_store.patch(ROOT, rel, {"ai_summary": full.strip()})
+        anno_store.patch(root, rel, {"ai_summary": full.strip()})
     return {"summary": full, "cached": False}
 
 
@@ -1114,13 +1162,15 @@ def api_ai_tts_clear():
 @app.get("/api/anno/all")
 def api_anno_all():
     """All annotations + tag palette for the current root."""
-    return anno_store.all_for_root(ROOT)
+    if not _has_root():
+        return {"files": {}, "tag_palette": [], "needs_root": True}
+    return anno_store.all_for_root(_require_root())
 
 
 @app.get("/api/anno")
 def api_anno_get(path: str = Query(...)):
     _safe_resolve(path)  # validate
-    return anno_store.get(ROOT, path)
+    return anno_store.get(_require_root(), path)
 
 
 @app.patch("/api/anno")
@@ -1132,7 +1182,7 @@ async def api_anno_patch(request: Request, path: str = Query(...)):
         raise HTTPException(400, "invalid JSON body")
     if not isinstance(body, dict):
         raise HTTPException(400, "body must be a JSON object")
-    return anno_store.patch(ROOT, path, body)
+    return anno_store.patch(_require_root(), path, body)
 
 
 class TagPaletteBody(BaseModel):
@@ -1141,19 +1191,25 @@ class TagPaletteBody(BaseModel):
 
 @app.put("/api/anno/palette")
 def api_anno_palette(body: TagPaletteBody):
-    return {"palette": anno_store.set_palette(ROOT, body.tags)}
+    return {"palette": anno_store.set_palette(_require_root(), body.tags)}
 
 
 @app.get("/api/health")
 def api_health():
-    return {"ok": True, "soffice": converter.find_soffice(), "root": str(ROOT)}
+    return {"ok": True, "soffice": converter.find_soffice(),
+            "root": str(ROOT) if _has_root() else None,
+            "needs_root": not _has_root()}
 
 
 @app.get("/api/root")
 def api_root_get():
+    if not _has_root():
+        return {"root": None, "last_file": None, "needs_root": True}
+    root = _require_root()
     return {
-        "root": str(ROOT),
-        "last_file": _get_last_file(ROOT),
+        "root": str(root),
+        "last_file": _get_last_file(root),
+        "needs_root": False,
     }
 
 
@@ -1175,7 +1231,7 @@ def api_root_set(body: RootBody):
     _set_last_root(ROOT)
     # Reset & re-build search index for the new root.
     search_mod.clear_cache()
-    return {"root": str(ROOT), "last_file": _get_last_file(ROOT)}
+    return {"root": str(ROOT), "last_file": _get_last_file(ROOT), "needs_root": False}
 
 
 @app.post("/api/reveal")
@@ -1215,7 +1271,7 @@ def api_pick_folder():
         root.withdraw()
         root.attributes("-topmost", True)
         try:
-            initial = str(ROOT) if ROOT.exists() else str(APP_DIR)
+            initial = str(ROOT) if _has_root() else str(APP_DIR)
             chosen = filedialog.askdirectory(
                 title="选择资料根目录", initialdir=initial, parent=root
             )
@@ -1254,7 +1310,7 @@ def _open_browser_later(url: str, delay: float = 1.0):
     threading.Thread(target=_open, daemon=True).start()
 
 
-def _resolve_initial_root(cli_root: Optional[str]) -> Path:
+def _resolve_initial_root(cli_root: Optional[str]) -> Optional[Path]:
     """Priority: explicit CLI > saved state last_root > default folder under APP_DIR."""
     # explicit CLI takes precedence
     if cli_root:
@@ -1278,6 +1334,8 @@ def _resolve_initial_root(cli_root: Optional[str]) -> Path:
     p = (APP_DIR / DEFAULT_ROOT_REL).resolve()
     if p.exists() and p.is_dir():
         return p
+    if getattr(sys, "frozen", False):
+        return None
     return APP_DIR
 
 
@@ -1298,7 +1356,8 @@ def main():
     global ROOT, PRECONVERT_ENABLED
     ROOT = _resolve_initial_root(args.root)
     PRECONVERT_ENABLED = not args.no_preconvert
-    _set_last_root(ROOT)
+    if _has_root():
+        _set_last_root(_require_root())
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     log_dir = init_logging(DATA_DIR)

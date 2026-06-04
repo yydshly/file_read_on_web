@@ -13,3 +13,37 @@ app_data/
 build/
 dist/
 *.spec
+
+# env / secrets
+.env
+.env.*
+!.env.example
+
+# local user materials
+教学资料/
+资料/
+data/
+documents/
+
+# bundled third-party runtime
+libreoffice/
+LibreOffice/
+
+# package / binary / media
+*.zip
+*.rar
+*.7z
+*.tar
+*.gz
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.c4d
+*.psd
+*.ai
+
+# local temp
+tmp/
+temp/
+.local/

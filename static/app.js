@@ -42,12 +42,23 @@ let pathToDirLi = new Map();
 
 async function refreshRoot() {
   const r = await fetch('/api/root');
+  if (!r.ok) throw new Error(await apiErrorText(r));
   const d = await r.json();
-  rootPathEl.textContent = d.root;
-  rootPathEl.title = d.root;
+  rootPathEl.textContent = d.root || '\u672a\u9009\u62e9\u8d44\u6599\u76ee\u5f55';
+  rootPathEl.title = d.root || '';
   currentRootKey = d.root || '';
   return d;
 }
+
+function showNeedsRootState() {
+  resetWorkspaceView();
+  annoCache = { files: {}, tag_palette: [] };
+  scannedPaths = new Set();
+  treeEl.innerHTML = '<div class="empty-state">\u8bf7\u9009\u62e9\u8d44\u6599\u76ee\u5f55</div>';
+  viewerEl.innerHTML = '<div class="empty-state"><h2>\u8bf7\u9009\u62e9\u8d44\u6599\u76ee\u5f55</h2><p>\u70b9\u51fb\u5de6\u4e0a\u89d2\u201c\u5207\u6362\u201d\u9009\u62e9\u4f60\u7684\u8d44\u6599\u6587\u4ef6\u5939\u3002</p></div>';
+  preconvertEl.style.display = 'none';
+}
+
 
 function resetWorkspaceView() {
   currentPath = null;
@@ -86,14 +97,20 @@ function scheduleSaveOpenDirs() {
 }
 
 async function loadTree() {
-  treeEl.innerHTML = '加载中…';
+  treeEl.innerHTML = '\u52a0\u8f7d\u4e2d...';
   const r = await fetch('/api/tree?recursive=1');
+  if (!r.ok) throw new Error(await apiErrorText(r));
   const data = await r.json();
+  if (data.needs_root) {
+    showNeedsRootState();
+    return false;
+  }
   pathToLi = new Map();
   pathToDirLi = new Map();
   treeEl.innerHTML = '';
   const openSet = loadOpenDirSet();
-  treeEl.appendChild(renderNodes(data.children, openSet));
+  treeEl.appendChild(renderNodes(data.children || [], openSet));
+  return true;
 }
 
 async function loadDirChildren(li, sub) {
@@ -101,6 +118,7 @@ async function loadDirChildren(li, sub) {
   li.dataset.loading = '1';
   try {
     const r = await fetch('/api/tree?path=' + encodeURIComponent(li.dataset.dirPath || ''));
+    if (!r.ok) throw new Error(await apiErrorText(r));
     const data = await r.json();
     const next = renderNodes(data.children || [], loadOpenDirSet());
     next.style.display = sub.style.display;
@@ -417,7 +435,7 @@ function applyFilter(root, kw) {
 
 async function apiErrorText(r) {
   const j = await r.json().catch(() => ({}));
-  return j.detail || ('HTTP ' + r.status);
+  return j.detail || j.message || ('HTTP ' + r.status);
 }
 
 async function switchRootPath(path) {
@@ -427,6 +445,10 @@ async function switchRootPath(path) {
     body: JSON.stringify({ path }),
   });
   if (!r.ok) throw new Error(await apiErrorText(r));
+  annoCache = { files: {}, tag_palette: [] };
+  scannedPaths = new Set();
+  if (typeof aiClearConv === 'function') aiClearConv();
+  if (typeof onFileSelected === 'function') onFileSelected(null);
   resetWorkspaceView();
   await bootstrap();
 }
@@ -467,12 +489,9 @@ revealBtn.addEventListener('click', async () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ path: currentPath }),
     });
-    if (!r.ok) {
-      const j = await r.json().catch(() => ({}));
-      alert('打开失败：' + (j.detail || r.status));
-    }
+    if (!r.ok) alert('?????' + await apiErrorText(r));
   } catch (err) {
-    alert('打开出错：' + err);
+    alert('?????' + (err.message || err));
   }
 });
 
@@ -514,6 +533,10 @@ async function loadAnno() {
   const r = await fetch('/api/anno/all');
   if (!r.ok) throw new Error(await apiErrorText(r));
   annoCache = await r.json();
+  if (annoCache.needs_root) {
+    annoCache = { files: {}, tag_palette: [] };
+    return;
+  }
   refreshAllBadges();
   if (currentPath) renderAnnoBar();  // refresh anno panel for already-open file
 }
@@ -717,7 +740,12 @@ let _scannedPrebuildSeenDone = false;
 async function loadScanned() {
   try {
     const r = await fetch('/api/search/scanned');
+    if (!r.ok) throw new Error(await apiErrorText(r));
     const d = await r.json();
+    if (d.needs_root) {
+      scannedPaths = new Set();
+      return;
+    }
     const prevCount = scannedPaths.size;
     scannedPaths = new Set(d.scanned || []);
     if (scannedPaths.size !== prevCount) refreshAllBadges();
@@ -741,14 +769,24 @@ async function _scannedPollStep() {
 _scannedPollTimer = setInterval(_scannedPollStep, 5000);
 
 async function bootstrap() {
-  const info = await refreshRoot();
-  await loadTree();
-  await loadAnno();
-  await loadScanned();
-  if (info.last_file) {
-    setTimeout(() => openFileByPath(info.last_file), 0);
+  try {
+    const info = await refreshRoot();
+    if (info.needs_root) {
+      showNeedsRootState();
+      return;
+    }
+    const treeLoaded = await loadTree();
+    if (!treeLoaded) return;
+    await loadAnno();
+    await loadScanned();
+    if (info.last_file) {
+      setTimeout(() => openFileByPath(info.last_file), 0);
+    }
+    pollPreconvert();
+  } catch (err) {
+    treeEl.innerHTML = '<div class="error-box">' + escapeHtml('???????' + (err.message || err)) + '</div>';
+    viewerEl.innerHTML = '<div class="error-box">' + escapeHtml('???????' + (err.message || err)) + '</div>';
   }
-  pollPreconvert();
 }
 
 // --- Right-click context menu on tree items ---
@@ -768,7 +806,9 @@ function showCtxMenu(x, y, items) {
     div.textContent = it.label;
     div.addEventListener('click', () => {
       hideCtxMenu();
-      try { it.action(); } catch (e) { console.error(e); }
+      try {
+        Promise.resolve(it.action()).catch(e => alert(e.message || e));
+      } catch (e) { alert(e.message || e); }
     });
     ctxMenuEl.appendChild(div);
   }
@@ -861,17 +901,18 @@ async function runContentSearch() {
   const q = searchInput.value.trim();
   if (!q) { showTreeView(); return; }
   showSearchView();
-  searchResultsEl.innerHTML = `<div class="sr-head"><span>搜索中…</span><button id="sr-close">× 返回</button></div>`;
+  searchResultsEl.innerHTML = '<div class="sr-head"><span>???...</span><button id="sr-close">? ??</button></div>';
   document.getElementById('sr-close').addEventListener('click', () => {
     searchInput.value = '';
     showTreeView();
   });
   try {
     const r = await fetch('/api/search?q=' + encodeURIComponent(q) + '&limit=80');
+    if (!r.ok) throw new Error(await apiErrorText(r));
     const d = await r.json();
     renderSearchResults(d, q);
   } catch (err) {
-    searchResultsEl.innerHTML = `<div class="sr-head"><span>搜索失败：${escapeHtml(String(err))}</span><button id="sr-close">× 返回</button></div>`;
+    searchResultsEl.innerHTML = '<div class="sr-head"><span>' + escapeHtml('?????' + (err.message || err)) + '</span><button id="sr-close">? ??</button></div>';
     document.getElementById('sr-close').addEventListener('click', () => {
       searchInput.value = '';
       showTreeView();
@@ -1001,7 +1042,7 @@ function renderMarkdown(src) {
   let s = src.replace(/```([a-zA-Z0-9_+-]*)\r?\n([\s\S]*?)```/g, (_, lang, code) => {
     const i = codeBlocks.length;
     codeBlocks.push(`<pre><code>${escape(code.replace(/\r?\n$/, ''))}</code></pre>`);
-    return ` CB${i} `;
+    return `__CODE_BLOCK_${i}__`;
   });
 
   // 2. Escape everything else
@@ -1060,14 +1101,14 @@ function renderMarkdown(src) {
   s = s.split(/\n{2,}/).map(block => {
     block = block.trim();
     if (!block) return '';
-    if (/^<(h[1-6]|ul|ol|blockquote|pre|hr)\b/.test(block) || /^ CB\d+ /.test(block)) {
+    if (/^<(h[1-6]|ul|ol|blockquote|pre|hr)\b/.test(block) || /^__CODE_BLOCK_\d+__/.test(block)) {
       return block;
     }
     return `<p>${block.replace(/\n/g, '<br>')}</p>`;
   }).join('\n');
 
   // 9. Restore code blocks
-  s = s.replace(/ CB(\d+) /g, (_, i) => codeBlocks[parseInt(i, 10)]);
+  s = s.replace(/__CODE_BLOCK_(\d+)__/g, (_, i) => codeBlocks[parseInt(i, 10)]);
 
   return s;
 }
