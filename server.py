@@ -1420,9 +1420,14 @@ def main():
 
     # Check for existing service BEFORE initializing full state
     if not args.force_server and _is_our_service_running(args.host, args.port):
-        log.info("已有服务运行中 (http://%s:%d)，复用已有服务", args.host, args.port)
+        url = f"http://{args.host}:{args.port}/"
+        log.info("已有服务运行中 (%s)，复用已有服务", url)
         if not args.no_browser:
-            _open_browser_later(f"http://{args.host}:{args.port}/")
+            try:
+                webbrowser.open(url)
+                log.info("已打开已有服务页面: %s", url)
+            except Exception as e:
+                log.warning("打开已有服务页面失败: %s", e)
         return
 
     global ROOT, PRECONVERT_ENABLED
