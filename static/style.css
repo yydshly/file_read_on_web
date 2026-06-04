@@ -20,8 +20,20 @@ body.resizing iframe { pointer-events: none; }
 .sidebar-head strong { font-size: 14px; }
 .sidebar-head button { font-size: 12px; padding: 3px 8px; border: 1px solid #ccc; background: #f7f7f7; border-radius: 4px; cursor: pointer; }
 .sidebar-head button:hover { background: #eef3ff; border-color: #2d6cdf; color: #2d6cdf; }
-.sidebar-root-actions { margin-top: 4px; }
-.sidebar-root-actions #pick-root { width: 100%; }
+.sidebar-title-row {
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.sidebar-actions {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.sidebar-actions button {
+  white-space: nowrap;
+}
 .root-path { font-size: 11px; color: #777; margin-bottom: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
 #filter, #search-content { width: 100%; padding: 5px 8px; font-size: 13px; border: 1px solid #ddd; border-radius: 4px; }
 #search-content { margin-top: 6px; }

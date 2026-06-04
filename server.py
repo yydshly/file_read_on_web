@@ -1342,13 +1342,48 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 # ---------- startup ----------
 
-def _open_browser_later(url: str, delay: float = 1.0):
-    def _open():
-        time.sleep(delay)
+def _open_app_url(url: str) -> bool:
+    """Open app URL in the default browser as visibly/reliably as possible.
+
+    Windows: prefers os.startfile (opens in existing window, most visible).
+    Other: uses webbrowser.open with new=2 (new tab, foreground).
+    Always logs result.
+    """
+    log = get_logger("browse")
+    try:
+        if sys.platform.startswith("win"):
+            os.startfile(url)  # type: ignore[attr-defined]
+        else:
+            webbrowser.open(url, new=2)
+        log.info("已请求打开浏览器页面: %s", url)
+        return True
+    except Exception as e:
+        log.warning("打开浏览器页面失败: %s", e)
         try:
-            webbrowser.open(url)
-        except Exception:
-            pass
+            webbrowser.open(url, new=2)
+            log.info("已通过 webbrowser fallback 打开页面: %s", url)
+            return True
+        except Exception as e2:
+            log.warning("webbrowser fallback 也失败: %s", e2)
+            return False
+
+
+def _open_browser_when_ready(url: str, health_url: str, timeout: float = 8.0):
+    """Wait for the server to be ready (health endpoint responds), then open URL.
+
+    Uses a background thread so it never blocks startup.
+    """
+    def _open():
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                import urllib.request
+                with urllib.request.urlopen(health_url, timeout=0.4) as resp:
+                    if resp.status == 200:
+                        break
+            except Exception:
+                time.sleep(0.25)
+        _open_app_url(url)
     threading.Thread(target=_open, daemon=True).start()
 
 
@@ -1437,11 +1472,9 @@ def main():
         url = f"http://{args.host}:{args.port}/"
         log.info("已有服务运行中 (%s)，复用已有服务", url)
         if not args.no_browser:
-            try:
-                webbrowser.open(url)
-                log.info("已打开已有服务页面: %s", url)
-            except Exception as e:
-                log.warning("打开已有服务页面失败: %s", e)
+            opened = _open_app_url(url)
+            if not opened:
+                log.warning("请手动访问: %s", url)
         return
 
     global ROOT, PRECONVERT_ENABLED
@@ -1493,7 +1526,9 @@ def main():
              ai_tts_provider.info() if ai_tts_provider else "未配置")
 
     if not args.no_browser:
-        _open_browser_later(f"http://{args.host}:{args.port}/")
+        url = f"http://{args.host}:{args.port}/"
+        health_url = f"http://{args.host}:{args.port}/api/health"
+        _open_browser_when_ready(url, health_url)
 
     # Ensure orphaned soffice subprocesses are killed on exit
     import atexit, signal
