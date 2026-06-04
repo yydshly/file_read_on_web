@@ -195,3 +195,9 @@ dist/资料浏览器/
 程序会优先检测 `libreoffice/program/soffice.exe`。注意保留 LibreOffice 的许可证和版权说明文件。
 
 也可以不内置 LibreOffice，让用户自行安装。此时包体更小，维护更简单。
+
+## 当前稳定基线
+
+当前 Windows MVP 发布基线见：
+
+- [Release Baseline V1](docs/89-release-baseline-v1.md)
