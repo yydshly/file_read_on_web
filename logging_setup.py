@@ -22,7 +22,7 @@ def init_logging(data_dir: Path, level: int = logging.INFO) -> Path:
 
     log_dir = data_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / "server.log"
+    log_file = log_dir / "app.log"
 
     root = logging.getLogger()
     root.setLevel(level)

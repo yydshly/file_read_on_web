@@ -4,8 +4,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import logging
 import mimetypes
 import os
+import socket
 import subprocess
 import sys
 import threading
@@ -72,6 +74,8 @@ APP_DIR = _app_base_dir()
 DATA_DIR = _data_base_dir()
 RESOURCE_DIR = _resource_base_dir()
 STATIC_DIR = RESOURCE_DIR / "static"
+APP_ID = "file_read_on_web"
+APP_NAME = "资料浏览器"
 CACHE_DIR = DATA_DIR / "cache"
 TTS_CACHE_DIR = DATA_DIR / "cache" / "tts"   # hashed TTS audio bytes
 CONFIG_PATH = DATA_DIR / "config.json"   # user-editable: AI, preferences
@@ -1196,7 +1200,8 @@ def api_anno_palette(body: TagPaletteBody):
 
 @app.get("/api/health")
 def api_health():
-    return {"ok": True, "soffice": converter.find_soffice(),
+    return {"ok": True, "app_id": APP_ID, "app_name": APP_NAME,
+            "soffice": converter.find_soffice(),
             "root": str(ROOT) if _has_root() else None,
             "needs_root": not _has_root()}
 
@@ -1255,6 +1260,21 @@ def api_reveal(body: RootBody):
     return {"ok": True}
 
 
+@app.post("/api/shutdown")
+def api_shutdown(request: Request):
+    """Shutdown the server (local-only)."""
+    client = request.client
+    if client is None or client.host not in ("127.0.0.1", "localhost", "::1"):
+        raise HTTPException(403, "仅允许本地访问")
+    log = get_logger("browse")
+    log.info("收到退出程序请求 from %s", client.host)
+    killed = converter.kill_orphan_soffice()
+    if killed:
+        log.info("退出时清理 %d 个残留 soffice 进程", killed)
+    _delayed_exit(0.6)
+    return {"ok": True, "message": "程序正在退出"}
+
+
 @app.post("/api/pick-folder")
 def api_pick_folder():
     """Open a native OS folder-picker dialog (server-side via tkinter)."""
@@ -1293,6 +1313,15 @@ def api_pick_folder():
 @app.get("/")
 def index():
     return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/favicon.ico")
+def favicon():
+    """Serve favicon from static directory."""
+    favicon_path = STATIC_DIR / "favicon.ico"
+    if favicon_path.exists():
+        return FileResponse(favicon_path)
+    raise HTTPException(404, "favicon not found")
 
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -1339,6 +1368,37 @@ def _resolve_initial_root(cli_root: Optional[str]) -> Optional[Path]:
     return APP_DIR
 
 
+def _is_our_service_running(host: str, port: int, timeout: float = 0.35) -> bool:
+    """Check if our app is already running on host:port.
+
+    Returns True only if the service responds with our app_id.
+    Returns False if port is free or occupied by another service.
+    """
+    try:
+        conn = socket.create_connection((host, port), timeout=timeout)
+        conn.close()
+    except (socket.error, OSError):
+        return False
+    try:
+        import urllib.request
+        with urllib.request.urlopen(f"http://{host}:{port}/api/health", timeout=timeout) as resp:
+            body = resp.read().decode("utf-8")
+            if APP_ID in body:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _delayed_exit(delay: float = 0.6):
+    """Exit the process after a short delay (runs in a background thread)."""
+    def _exit():
+        time.sleep(delay)
+        os._exit(0)
+    t = threading.Thread(target=_exit, daemon=True)
+    t.start()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", default=None, help="initial root directory (overrides saved config)")
@@ -1347,11 +1407,23 @@ def main():
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument("--no-preconvert", action="store_true",
                         help="disable background pre-conversion of office files")
+    parser.add_argument("--force-server", action="store_true",
+                        help="start server even if another instance is already running")
     args = parser.parse_args()
 
     # Migrate legacy last_root/last_files (used to live in config.json) into state.json
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     _migrate_legacy_state()
+
+    log_dir = init_logging(DATA_DIR)
+    log = get_logger("browse")
+
+    # Check for existing service BEFORE initializing full state
+    if not args.force_server and _is_our_service_running(args.host, args.port):
+        log.info("已有服务运行中 (http://%s:%d)，复用已有服务", args.host, args.port)
+        if not args.no_browser:
+            _open_browser_later(f"http://{args.host}:{args.port}/")
+        return
 
     global ROOT, PRECONVERT_ENABLED
     ROOT = _resolve_initial_root(args.root)
@@ -1359,9 +1431,6 @@ def main():
     if _has_root():
         _set_last_root(_require_root())
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-    log_dir = init_logging(DATA_DIR)
-    log = get_logger("browse")
 
     cleaned = converter.cleanup_cache(CACHE_DIR, max_age_days=30)
     if cleaned["removed"]:
@@ -1373,11 +1442,16 @@ def main():
                  tts_cleaned["removed"], tts_cleaned["kept"], tts_cleaned["bytes"]/1024/1024)
 
     soffice = converter.find_soffice()
-    log.info("root: %s", ROOT)
+    log.info("程序启动: %s", APP_NAME)
+    log.info("app_dir: %s", APP_DIR)
     log.info("data: %s", DATA_DIR)
-    log.info("logs: %s", log_dir)
+    log.info("config: %s", CONFIG_PATH)
+    log.info("frozen: %s", getattr(sys, "frozen", False))
+    log.info("log_dir: %s", log_dir)
+    log.info("root: %s", ROOT)
     log.info("LibreOffice: %s",
              soffice or "未检测到（doc/docx/xlsx 等格式将无法预览，请安装 LibreOffice）")
+    log.info("host: %s  port: %s", args.host, args.port)
     log.info("open http://%s:%d/", args.host, args.port)
 
     # AI providers (best-effort: missing config just disables AI features)

@@ -5,6 +5,7 @@ const dlEl = document.getElementById('dl');
 const revealBtn = document.getElementById('reveal');
 const filterEl = document.getElementById('filter');
 const pickBtn = document.getElementById('pick-root');
+const shutdownBtn = document.getElementById('shutdown-btn');
 const rootPathEl = document.getElementById('root-path');
 const preconvertEl = document.getElementById('preconvert');
 const starBtn = document.getElementById('star');
@@ -1669,6 +1670,22 @@ cacheClearTtsBtn.addEventListener('click', async () => {
     alert(`已清空：${d.removed || 0} 项`);
     await refreshCacheUi();
   });
+});
+
+shutdownBtn.addEventListener('click', async () => {
+  if (!confirm('确定要退出后台服务吗？')) return;
+  try {
+    const r = await fetch('/api/shutdown', { method: 'POST' });
+    if (r.ok) {
+      viewerEl.innerHTML = '<div class="empty-state"><h2>程序已退出</h2><p>可以关闭此页面。</p></div>';
+      shutdownBtn.disabled = true;
+    } else {
+      const d = await r.json().catch(() => ({}));
+      alert('退出失败：' + (d.detail || r.statusText));
+    }
+  } catch (e) {
+    alert('退出失败：' + e.message);
+  }
 });
 
 // Initial fetch + refresh every 30s while window is visible.

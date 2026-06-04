@@ -103,8 +103,18 @@ search_index.json
 ```powershell
 python -m pip install pyinstaller
 
+# 开发调试（显示终端）
 pyinstaller `
   --onedir `
+  --name "资料浏览器" `
+  --icon "assets/app.ico" `
+  --add-data "static;static" `
+  server.py
+
+# 正式分发（无终端）
+pyinstaller `
+  --onedir `
+  --noconsole `
   --name "资料浏览器" `
   --icon "assets/app.ico" `
   --add-data "static;static" `
@@ -116,6 +126,10 @@ pyinstaller `
 ```text
 dist/资料浏览器/
 ```
+
+`start.bat` 是开发调试入口，会显示终端。
+正式分发 exe 使用 `--noconsole`，不显示终端窗口。
+无终端模式下日志写入 `app_data/logs/app.log`。
 
 可以将该目录压缩后分发给用户。
 
