@@ -42,6 +42,7 @@ import ai as ai_mod
 from ai import tasks as ai_tasks
 from ai import factory as ai_factory
 from ai.base import Message as AIMessage, CapabilityNotSupported, ProviderConfigError
+from ai.service import AiDocumentService, build_ai_status
 
 def _ensure_stdio_for_noconsole() -> None:
     """PyInstaller --noconsole may set stdout/stderr to None.
@@ -662,97 +663,16 @@ def api_search_scanned():
     return {"scanned": search_mod.scanned_files(_require_root())}
 
 
-# Thresholds for AI eligibility (kept in one place so tests/UI can fetch).
-_AI_TEXT_HARD_LIMIT_CHARS = 1_400_000   # ~500K tokens at avg 2.8 chars/token
-_AI_TEXT_SOFT_LIMIT_CHARS = 280_000     # ~100K tokens — above this we do summarize-first
+# AI document service (extracted to ai/service.py)
+ai_doc_service = AiDocumentService(CACHE_DIR)
 
 
 @app.get("/api/file/ai-eligibility")
 async def api_file_ai_eligibility(path: str = Query(...)):
-    """Tell the UI whether AI features apply to this file and why not.
-
-    HOTFIX-LOCAL-RESPONSIVENESS-V1 #1:
-        Now async; pypdf / text extraction is offloaded to the default
-        executor so a big PDF doesn't block the event loop and starve
-        other requests.
-    """
+    """Tell the UI whether AI features apply to this file and why not."""
     _require_root()
     src = _safe_resolve(path)
-    info = {
-        "path": path,
-        "supported": True,
-        "mode": "direct",   # direct | summarize_first | needs_conversion | vision_required | unsupported
-        "reasons": [],
-        "char_count": 0,
-        "is_scanned": False,
-    }
-    kind = converter.classify(src)
-    if kind == "image":
-        # HOTFIX-LOCAL-RESPONSIVENESS-V1 #5 + bb4af627 follow-up #3:
-        # Image files have no text content for the AI text flow. The UI
-        # used to round-trip to /api/ai/chat and fail late; we now mark
-        # them unsupported here so the front-end can refuse the click
-        # before bothering the user with an input box. The "mode" value
-        # is kept for compatibility but the user-facing message no longer
-        # promises a Vision/OCR UI affordance.
-        info["supported"] = False
-        info["mode"] = "vision_required"
-        info["reasons"].append(
-            "图片当前仅支持预览，暂不支持 AI 整理 / 问答。"
-            "未来可作为 Vision/OCR 扩展能力评估。"
-        )
-        return info
-    if kind == "unsupported":
-        info["supported"] = False
-        info["mode"] = "unsupported"
-        info["reasons"].append(f"不支持的文件类型：{src.suffix}")
-        return info
-
-    if kind in ("pdf", "office", "markdown", "text"):
-        # CPU-bound (pypdf extraction); run off the event loop.
-        loop = asyncio.get_running_loop()
-        text = await loop.run_in_executor(
-            None, search_mod.get_indexed_text, src, CACHE_DIR
-        )
-        info["char_count"] = len(text)
-        if kind == "pdf" and search_mod.is_scanned(src):
-            info["supported"] = False
-            info["is_scanned"] = True
-            info["mode"] = "unsupported"
-            info["reasons"].append(
-                "扫描版 PDF 无文本层，当前仅支持预览，暂不支持 AI 整理 / 问答。"
-                "未来可作为 Vision/OCR 扩展能力评估。"
-            )
-            return info
-        if not text.strip():
-            # Office files extract text from the converted PDF in cache.
-            # If the PDF isn't there yet, eligibility is still "supported"
-            # — the actual AI call will trigger conversion on demand.
-            if kind == "office":
-                info["mode"] = "needs_conversion"
-                info["reasons"].append(
-                    "首次使用时需要先转换为 PDF（首条 AI 请求会触发，约 3-15s）"
-                )
-                return info
-            info["supported"] = False
-            info["mode"] = "unsupported"
-            info["reasons"].append("尚未索引到任何文本内容（可能预转换/索引还没跑完）")
-            return info
-        if info["char_count"] > _AI_TEXT_HARD_LIMIT_CHARS:
-            info["supported"] = False
-            info["mode"] = "unsupported"
-            info["reasons"].append(
-                f"文档过大（{info['char_count']:,} 字符 > {_AI_TEXT_HARD_LIMIT_CHARS:,}），"
-                "未来可作为 RAG/切分检索能力评估"
-            )
-            return info
-        if info["char_count"] > _AI_TEXT_SOFT_LIMIT_CHARS:
-            info["mode"] = "summarize_first"
-            info["reasons"].append(
-                f"文档较长（{info['char_count']:,} 字符），将先生成结构化摘要，"
-                "后续问答基于摘要 + 检索片段"
-            )
-    return info
+    return await ai_doc_service.eligibility(src, path)
 
 
 @app.post("/api/search/rebuild")
@@ -798,111 +718,11 @@ def _ai_require_tts() -> Any:
     return ai_tts_provider
 
 
-async def _ai_load_document(path: str) -> tuple[Path, str]:
-    """Resolve a file and return (Path, indexed text). Raises HTTPException
-    with a clear reason if AI features are unavailable for this file.
-
-    For office files this awaits ``office_to_pdf`` if needed — extraction
-    relies on the converted PDF being present in cache. Without this, AI
-    actions on a freshly opened (but not yet pre-converted) office file
-    would error with "尚未索引到文本".
-    """
-    src = _safe_resolve(path)
-    if src.is_dir():
-        raise HTTPException(400, "path is a directory")
-    kind = converter.classify(src)
-    if kind == "image":
-        raise HTTPException(
-            400,
-            "图片当前仅支持预览，暂不支持 AI 整理 / 问答。"
-            "未来可作为 Vision/OCR 扩展能力评估。",
-        )
-    if kind == "unsupported":
-        raise HTTPException(400, f"不支持的文件类型：{src.suffix}")
-    if kind == "pdf" and search_mod.is_scanned(src):
-        raise HTTPException(
-            422,
-            "扫描版 PDF 无文本层，当前仅支持预览，暂不支持 AI 整理 / 问答。"
-            "未来可作为 Vision/OCR 扩展能力评估。",
-        )
-
-    # Office: ensure the converted PDF exists before we try to read text from it.
-    # office_to_pdf is cached + locked, so this is a no-op on hit.
-    if kind == "office":
-        try:
-            await converter.office_to_pdf(src, CACHE_DIR)
-        except RuntimeError as e:
-            raise HTTPException(
-                422, f"该 office 文件无法转换为 PDF，AI 不可用：{e}"
-            )
-
-    # HOTFIX (follow-up to HOTFIX-LOCAL-RESPONSIVENESS-V1 #1):
-    # The eligibility endpoint already offloads this call, but /api/ai/summarize
-    # and /api/ai/chat reach text extraction via this function — if the user
-    # invokes AI without first opening the panel (or the in-memory text cache
-    # was cleared), a large uncached PDF would block the event loop for 10-30s
-    # of synchronous pypdf work. Mirror the eligibility fix here.
-    loop = asyncio.get_running_loop()
-    text = await loop.run_in_executor(
-        None, search_mod.get_indexed_text, src, CACHE_DIR
-    )
-    if kind == "pdf" and (search_mod.is_scanned(src) or not text.strip()):
-        raise HTTPException(
-            422,
-            "扫描版 PDF 没有可提取的文本层，暂不支持 AI 整理 / 对话。"
-            "请先通过 OCR 转成可复制文本后再使用。",
-        )
-    if not text.strip():
-        raise HTTPException(422, "文档尚未索引到文本（预转换 / 索引可能还没跑完）")
-    if len(text) > _AI_TEXT_HARD_LIMIT_CHARS:
-        raise HTTPException(
-            413,
-            f"文档过大（{len(text):,} 字符 > {_AI_TEXT_HARD_LIMIT_CHARS:,}）；"
-            "未来可作为 RAG/切分检索能力评估。",
-        )
-    return src, text
-
-
-def _mask_key(k: Optional[str]) -> str:
-    if not k:
-        return "(empty)"
-    k = str(k)
-    if len(k) <= 8:
-        return "*" * len(k)
-    return f"{k[:4]}…{k[-4:]} (len={len(k)})"
-
-
 @app.get("/api/ai/status")
 def api_ai_status():
     """Status + masked credential preview so users can verify the running
     process actually picked up their env vars."""
-    text_info = ai_text_provider.info() if ai_text_provider else None
-    tts_info = ai_tts_provider.info() if ai_tts_provider else None
-    if text_info and hasattr(ai_text_provider, "api_key"):
-        text_info["api_key_preview"] = _mask_key(ai_text_provider.api_key)
-        if hasattr(ai_text_provider, "group_id"):
-            text_info["group_id_preview"] = _mask_key(getattr(ai_text_provider, "group_id", ""))
-    if tts_info and hasattr(ai_tts_provider, "api_key"):
-        tts_info["api_key_preview"] = _mask_key(ai_tts_provider.api_key)
-        if hasattr(ai_tts_provider, "group_id"):
-            tts_info["group_id_preview"] = _mask_key(getattr(ai_tts_provider, "group_id", ""))
-        if hasattr(ai_tts_provider, "base_url"):
-            tts_info["base_url"] = getattr(ai_tts_provider, "base_url")
-    # Also surface which env vars the OS reports — useful when users wonder
-    # whether their `set` / `setx` actually reached this process.
-    env_seen = {}
-    for k in ("MINIMAX_API_KEY", "MINIMAX_GROUP_ID", "MIMO_API_KEY"):
-        env_seen[k] = _mask_key(os.environ.get(k))
-    return {
-        "text": text_info,
-        "tts": tts_info,
-        "providers_available": ai_factory.available_provider_types(),
-        "thresholds": {
-            "hard_limit_chars": _AI_TEXT_HARD_LIMIT_CHARS,
-            "soft_limit_chars": _AI_TEXT_SOFT_LIMIT_CHARS,
-        },
-        "env": env_seen,
-    }
+    return build_ai_status(ai_text_provider, ai_tts_provider)
 
 
 def _sse_stream(token_iter):
@@ -933,7 +753,8 @@ async def api_ai_summarize(body: AiSummarizeBody):
 
     async def run_stream():
         yield {"stage": "准备文档"}
-        src, text = await _ai_load_document(body.path)
+        src = _safe_resolve(body.path)
+        src, text = await ai_doc_service.load_document(src)
         root = _require_root()
         rel = body.path
 
@@ -960,7 +781,8 @@ async def api_ai_summarize(body: AiSummarizeBody):
     if body.stream:
         return _sse_stream(run_stream())
 
-    src, text = await _ai_load_document(body.path)
+    src = _safe_resolve(body.path)
+    src, text = await ai_doc_service.load_document(src)
     root = _require_root()
     rel = body.path
     if not body.force:
@@ -980,7 +802,8 @@ async def api_ai_summarize(body: AiSummarizeBody):
 @app.post("/api/ai/chat")
 async def api_ai_chat(body: AiChatBody):
     provider = _ai_require_text()
-    src, text = await _ai_load_document(body.path)
+    src = _safe_resolve(body.path)
+    src, text = await ai_doc_service.load_document(src)
     history = [AIMessage(role=m["role"], content=m["content"]) for m in body.history
                if m.get("role") in {"user", "assistant"} and m.get("content")]
 
