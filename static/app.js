@@ -489,9 +489,9 @@ revealBtn.addEventListener('click', async () => {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ path: currentPath }),
     });
-    if (!r.ok) alert('?????' + await apiErrorText(r));
+    if (!r.ok) alert('打开本地位置失败：' + await apiErrorText(r));
   } catch (err) {
-    alert('?????' + (err.message || err));
+    alert('打开本地位置失败：' + (err.message || err));
   }
 });
 
@@ -784,8 +784,9 @@ async function bootstrap() {
     }
     pollPreconvert();
   } catch (err) {
-    treeEl.innerHTML = '<div class="error-box">' + escapeHtml('???????' + (err.message || err)) + '</div>';
-    viewerEl.innerHTML = '<div class="error-box">' + escapeHtml('???????' + (err.message || err)) + '</div>';
+    const msg = '初始化失败：' + (err.message || err);
+    treeEl.innerHTML = '<div class="error-box">' + escapeHtml(msg) + '</div>';
+    viewerEl.innerHTML = '<div class="error-box">' + escapeHtml(msg) + '</div>';
   }
 }
 
@@ -901,7 +902,7 @@ async function runContentSearch() {
   const q = searchInput.value.trim();
   if (!q) { showTreeView(); return; }
   showSearchView();
-  searchResultsEl.innerHTML = '<div class="sr-head"><span>???...</span><button id="sr-close">? ??</button></div>';
+  searchResultsEl.innerHTML = '<div class="sr-head"><span>搜索中…</span><button id="sr-close">× 返回</button></div>';
   document.getElementById('sr-close').addEventListener('click', () => {
     searchInput.value = '';
     showTreeView();
@@ -912,7 +913,7 @@ async function runContentSearch() {
     const d = await r.json();
     renderSearchResults(d, q);
   } catch (err) {
-    searchResultsEl.innerHTML = '<div class="sr-head"><span>' + escapeHtml('?????' + (err.message || err)) + '</span><button id="sr-close">? ??</button></div>';
+    searchResultsEl.innerHTML = '<div class="sr-head"><span>' + escapeHtml('搜索失败：' + (err.message || err)) + '</span><button id="sr-close">× 返回</button></div>';
     document.getElementById('sr-close').addEventListener('click', () => {
       searchInput.value = '';
       showTreeView();

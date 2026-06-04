@@ -37,7 +37,10 @@ _text_cache: dict[str, tuple[float, str]] = {}
 _skipped: dict[str, str] = {}      # abs path -> reason (file completely skipped)
 _scanned: set[str] = set()         # abs paths of PDFs detected as scanned (image-only)
 _cache_lock = threading.Lock()
-_SKIP_DIRS = {"__pycache__", "node_modules", ".git", ".idea", ".vscode"}
+_SKIP_DIRS = {
+    "__pycache__", "node_modules", ".git", ".idea", ".vscode",
+    "build", "dist", "app_data", "_internal", "libreoffice", "LibreOffice",
+}
 
 
 def _extract_pdf(p: Path) -> str:
