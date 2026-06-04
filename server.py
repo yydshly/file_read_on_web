@@ -21,18 +21,17 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-import annotations as annotations_mod
-import app_metadata
-import converter
-import search as search_mod
-from app_metadata import APP_ID, APP_NAME, APP_VERSION, RELEASE_BASELINE
-from logging_setup import init_logging, get_logger
-from safeio import atomic_write_json, read_json
+from src.backend.services import annotations as annotations_mod
+from src.backend.services import converter
+from src.backend.services import search as search_mod
+from src.backend.domain.app_metadata import APP_ID, APP_NAME, APP_VERSION, RELEASE_BASELINE
+from src.backend.infra.logging_setup import init_logging, get_logger
+from src.backend.infra.safeio import read_json
 from src.backend.services.runtime_state import RuntimeStateStore
 from src.backend.services.tts_cache import TtsCache
 
 try:
-    from tray_controller import TrayController
+    from src.backend.infra.tray_controller import TrayController
     _TRAY_AVAILABLE = True
 except Exception:
     _TRAY_AVAILABLE = False

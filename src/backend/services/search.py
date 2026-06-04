@@ -19,14 +19,14 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
+from . import converter
+
 log = logging.getLogger("search")
 
 try:
     import pypdf  # type: ignore
 except ImportError:  # pragma: no cover
     pypdf = None  # noqa
-
-from converter import _cache_key, OFFICE_EXTS
 
 _TEXT_EXTS = {".md", ".txt", ".log", ".csv"}
 _PDF_PAGE_CAP = 200                # don't extract beyond this many pages
@@ -79,9 +79,9 @@ def _extract_text(p: Path, cache_dir: Path) -> str:
             return p.read_text(encoding="utf-8", errors="replace")[:_TEXT_LEN_CAP]
         except Exception:
             return ""
-    if ext in OFFICE_EXTS:
+    if ext in converter.OFFICE_EXTS:
         try:
-            key = _cache_key(p)
+            key = converter._cache_key(p)
         except OSError:
             return ""
         pdf = cache_dir / f"{key}.pdf"
@@ -268,7 +268,7 @@ def prebuild(root: Path, cache_dir: Path,
                 continue
             p = Path(dirpath) / name
             ext = p.suffix.lower()
-            if ext in _TEXT_EXTS or ext == ".pdf" or ext in OFFICE_EXTS:
+            if ext in _TEXT_EXTS or ext == ".pdf" or ext in converter.OFFICE_EXTS:
                 paths.append(p)
 
     _prebuild_status["total"] = len(paths)
@@ -313,7 +313,7 @@ def _clean_utf8_text(text: str) -> str:
 
 def save_index(index_path: Path) -> bool:
     """Persist the text cache to disk. Best-effort; returns success bool."""
-    from safeio import atomic_write_json
+    from src.backend.infra.safeio import atomic_write_json
     try:
         with _cache_lock:
             payload = {
@@ -335,7 +335,7 @@ def save_index(index_path: Path) -> bool:
 def load_index(index_path: Path) -> int:
     """Restore the text cache from disk. Drops entries whose source file has
     changed mtime. Returns number of entries loaded."""
-    from safeio import read_json
+    from src.backend.infra.safeio import read_json
     payload = read_json(index_path, default=None)
     if not isinstance(payload, dict):
         return 0

@@ -17,8 +17,8 @@ from typing import Any, Optional
 
 from fastapi import HTTPException
 
-import converter
-import search as search_mod
+from src.backend.services import converter
+from src.backend.services import search as search_mod
 from src.ai import factory as ai_factory
 
 AI_TEXT_HARD_LIMIT_CHARS = 1_400_000   # ~500K tokens at avg 2.8 chars/token

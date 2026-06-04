@@ -26,7 +26,7 @@ import time
 from copy import deepcopy
 from pathlib import Path
 
-from safeio import atomic_write_json, read_json
+from src.backend.infra.safeio import atomic_write_json, read_json
 
 _DEFAULT_PALETTE = ["已看", "重点", "待复习"]
 

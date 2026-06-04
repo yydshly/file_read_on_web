@@ -19,8 +19,8 @@ from copy import deepcopy
 from pathlib import Path
 from typing import Optional
 
-from safeio import atomic_write_json, read_json
-from logging_setup import get_logger
+from src.backend.infra.safeio import atomic_write_json, read_json
+from src.backend.infra.logging_setup import get_logger
 
 _STATE_DEBOUNCE_SECONDS = 0.5
 

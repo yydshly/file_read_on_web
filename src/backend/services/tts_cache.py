@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from logging_setup import get_logger
+from src.backend.infra.logging_setup import get_logger
 
 TEXT_LIMIT_CHARS = 5000
 MAX_AGE_DAYS = 60
