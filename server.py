@@ -13,7 +13,6 @@ import sys
 import threading
 import time
 import webbrowser
-from copy import deepcopy
 from pathlib import Path
 from typing import Any, Optional
 
@@ -29,6 +28,8 @@ import search as search_mod
 from app_metadata import APP_ID, APP_NAME, APP_VERSION, RELEASE_BASELINE
 from logging_setup import init_logging, get_logger
 from safeio import atomic_write_json, read_json
+from runtime_state import RuntimeStateStore
+from tts_cache import TtsCache
 
 try:
     from tray_controller import TrayController
@@ -106,6 +107,7 @@ SEARCH_INDEX_PATH = DATA_DIR / "search_index.json"
 DEFAULT_ROOT_REL = "教学资料"
 
 anno_store = annotations_mod.AnnotationStore(ANNO_PATH)
+tts_cache = TtsCache(TTS_CACHE_DIR)
 
 app = FastAPI()
 
@@ -133,171 +135,8 @@ def _load_config() -> dict:
     return d if isinstance(d, dict) else {}
 
 
-# ---------- state (auto-managed runtime memory) ----------
-# HOTFIX-LOCAL-RESPONSIVENESS-V1 #4:
-# Previous code did atomic_write_json on every file click (5-50ms each on
-# SSDs, worse on HDD / network drives). We now keep state in memory and
-# debounce-flush to disk on a background timer. atexit + signal handlers
-# guarantee the final state is persisted at shutdown.
-
-_STATE_DEBOUNCE_SECONDS = 0.5
-_state_lock = threading.Lock()
-_state_cache: Optional[dict] = None
-_state_dirty = False
-_state_save_timer: Optional[threading.Timer] = None
-
-
-def _load_state() -> dict:
-    """Return the cached state dict (loaded lazily from disk once)."""
-    global _state_cache
-    with _state_lock:
-        if _state_cache is None:
-            d = read_json(STATE_PATH, default={})
-            _state_cache = d if isinstance(d, dict) else {}
-        return _state_cache
-
-
-def _flush_state(force: bool = False) -> None:
-    """Write the in-memory state to disk if dirty. Safe to call from any
-    thread (including atexit / signal handlers)."""
-    global _state_dirty
-    with _state_lock:
-        if _state_cache is None or (not _state_dirty and not force):
-            return
-        snapshot = deepcopy(_state_cache)
-        _state_dirty = False
-    try:
-        atomic_write_json(STATE_PATH, snapshot)
-    except Exception as e:
-        # Re-mark dirty so the next mutation triggers another attempt.
-        with _state_lock:
-            _state_dirty = True
-        try:
-            get_logger("browse").warning("state flush failed: %s", e)
-        except Exception:
-            pass
-
-
-def _schedule_state_save() -> None:
-    """Debounce: arm a single-shot timer; rapid calls collapse to one write."""
-    global _state_save_timer
-    with _state_lock:
-        if _state_save_timer is not None:
-            _state_save_timer.cancel()
-        _state_save_timer = threading.Timer(_STATE_DEBOUNCE_SECONDS, _flush_state)
-        _state_save_timer.daemon = True
-        _state_save_timer.start()
-
-
-def _save_state(state: dict) -> None:
-    """Replace the cached state and schedule a debounced disk flush."""
-    global _state_cache, _state_dirty
-    with _state_lock:
-        _state_cache = dict(state)
-        _state_dirty = True
-    _schedule_state_save()
-
-
-def _migrate_legacy_state() -> None:
-    """Import legacy ``last_root`` / ``last_files`` keys from ``config.json``
-    into the runtime-managed ``state.json``.
-
-    HOTFIX-MIGRATION-TTS-CLEANUP-V1 Fix B:
-        Migration is now **state-only** — it never writes ``config.json``.
-        config.json is the user-editable configuration file and must not be
-        automatically rewritten by the server. The legacy keys, if present
-        in config.json, are simply ignored at runtime once state.json
-        exists. This preserves the strict
-            config.json = user-editable
-            state.json  = auto-managed
-        contract and removes the previous 500ms race window where
-        config.json would be rewritten while state.json was only
-        scheduled (debounced) to be written.
-
-    Migration is idempotent: it runs only when state.json does not yet
-    exist, and on failure leaves config.json untouched so the next
-    startup can retry cleanly.
-    """
-    if STATE_PATH.exists():
-        return
-    cfg = _load_config()
-    if not isinstance(cfg, dict):
-        return
-
-    # Read (do NOT mutate) legacy keys from cfg.
-    moved: dict = {}
-    if "last_root" in cfg:
-        moved["last_root"] = cfg["last_root"]
-    if "last_files" in cfg:
-        moved["last_files"] = cfg["last_files"]
-    if not moved:
-        return
-
-    # 1. Stage state in memory + schedule debounced flush.
-    _save_state(moved)
-    # 2. Force-flush so the migration is durable before we report success.
-    #    If this fails state.json may not exist; we then leave config.json
-    #    alone so the next startup can retry.
-    _flush_state(force=True)
-
-    log = get_logger("browse")
-    if STATE_PATH.exists():
-        log.info(
-            "迁移：legacy last_root / last_files 已导入 state.json；"
-            "config.json 中旧字段将被忽略"
-        )
-    else:
-        log.warning(
-            "迁移：state.json 落盘失败，config.json 保持不变以便下次启动重试"
-        )
-
-
-def _root_key(root: Path) -> str:
-    return str(root.resolve()).replace("\\", "/")
-
-
-def _get_last_file(root: Path) -> Optional[str]:
-    """Read the cached last_file for ``root``.
-
-    bb4af627 follow-up #1: do NOT call _load_state() while holding
-    _state_lock — the prior version did, which would deadlock on the first
-    read because _load_state itself acquires _state_lock (a non-reentrant
-    threading.Lock). We now load outside the critical section (the same
-    pattern _set_last_file / _set_last_root already use) and the lock just
-    serialises the snapshot read.
-    """
-    if _state_cache is None:
-        _load_state()
-    key = _root_key(root)
-    with _state_lock:
-        state = _state_cache if _state_cache is not None else {}
-        return (state.get("last_files") or {}).get(key)
-
-
-def _set_last_file(root: Path, rel: str) -> None:
-    """Atomically update last_files[root] + last_root in memory, then schedule
-    a debounced disk flush."""
-    global _state_dirty
-    if _state_cache is None:
-        _load_state()
-    key = _root_key(root)
-    with _state_lock:
-        last_files = _state_cache.setdefault("last_files", {})  # type: ignore[union-attr]
-        last_files[key] = rel
-        _state_cache["last_root"] = key                          # type: ignore[index]
-        _state_dirty = True
-    _schedule_state_save()
-
-
-def _set_last_root(root: Path) -> None:
-    global _state_dirty
-    if _state_cache is None:
-        _load_state()
-    key = _root_key(root)
-    with _state_lock:
-        _state_cache["last_root"] = key                          # type: ignore[index]
-        _state_dirty = True
-    _schedule_state_save()
+# ---------- runtime state service ----------
+state_store = RuntimeStateStore(STATE_PATH, CONFIG_PATH)
 
 
 # ---------- path safety ----------
@@ -543,7 +382,7 @@ def _warm_office_candidates(root: Path, limit: int = 2) -> list[Path]:
     """
     all_files = list(_iter_files_in_tree_order(root))
 
-    last = _get_last_file(root)
+    last = state_store.get_last_file(root)
     start = 0
     if last:
         last_path = (root / last).resolve()
@@ -625,7 +464,7 @@ async def _on_shutdown():
     # Final flush of debounced state (HOTFIX #4) — never lose the user's
     # last click just because we shut down before the timer fired.
     try:
-        _flush_state(force=True)
+        state_store.flush(force=True)
     except Exception:
         pass
 
@@ -667,7 +506,7 @@ async def api_file(path: str = Query(...), remember: int = 1, force: int = 0):
         raise HTTPException(400, "path is a directory")
 
     if remember:
-        _set_last_file(root, path)
+        state_store.set_last_file(root, path)
 
     kind = converter.classify(src)
     response: Response
@@ -735,7 +574,7 @@ def _dir_stats(d: Path, glob: str = "*") -> dict:
 def api_cache_stats():
     """Unified view of every on-disk cache the app maintains."""
     pdf = converter.cache_stats(CACHE_DIR)
-    tts = _dir_stats(TTS_CACHE_DIR, "*.audio")
+    tts = tts_cache.stats()
     idx = {
         "files": SEARCH_INDEX_PATH.exists() and 1 or 0,
         "bytes": SEARCH_INDEX_PATH.stat().st_size if SEARCH_INDEX_PATH.exists() else 0,
@@ -749,8 +588,8 @@ def api_cache_stats():
         },
         "tts_audio": {
             **tts,
-            "limit_bytes": TTS_CACHE_MAX_BYTES,
-            "max_age_days": TTS_CACHE_MAX_AGE_DAYS,
+            "limit_bytes": TtsCache.MAX_BYTES,
+            "max_age_days": TtsCache.MAX_AGE_DAYS,
         },
         "search_index": idx,
         "logs": logs,
@@ -763,7 +602,7 @@ def api_cache_cleanup():
     """Run cleanup on every cache (LRU + age)."""
     return {
         "office_pdf": converter.cleanup_cache(CACHE_DIR, max_age_days=30),
-        "tts_audio":  _tts_cleanup(),
+        "tts_audio":  tts_cache.cleanup(),
     }
 
 
@@ -1160,114 +999,6 @@ async def api_ai_chat(body: AiChatBody):
     return {"answer": full}
 
 
-# HOTFIX-MIGRATION-TTS-CLEANUP-V1 Fix C:
-# Single server-side cap for the text length we actually synthesise.
-# All three operations — cache lookup, provider invocation, and cache write —
-# must use the same effective text. Without this, two distinct inputs whose
-# first 5000 chars are identical produce identical audio but populate
-# different cache entries (waste) or, worse, never match in cache (miss
-# storm). Provider modules also truncate internally; this constant matches.
-_TTS_TEXT_LIMIT_CHARS = 5000
-
-
-def _tts_cache_paths(provider_name: str, text: str, voice: str | None,
-                     speed: float) -> tuple[Path, Path]:
-    """Return (audio_path, mime_meta_path) for a given TTS request.
-    Key = sha1(provider|model-config|text|voice|speed)."""
-    import hashlib
-    h = hashlib.sha1()
-    h.update(provider_name.encode("utf-8"))
-    h.update(b"|")
-    h.update((voice or "").encode("utf-8"))
-    h.update(b"|")
-    h.update(f"{speed:.2f}".encode("ascii"))
-    h.update(b"|")
-    h.update(text.encode("utf-8"))
-    key = h.hexdigest()
-    return TTS_CACHE_DIR / f"{key}.audio", TTS_CACHE_DIR / f"{key}.mime"
-
-
-def _tts_cache_get(provider_name: str, text: str, voice: str | None,
-                   speed: float) -> Optional[tuple[bytes, str]]:
-    audio_p, mime_p = _tts_cache_paths(provider_name, text, voice, speed)
-    if not audio_p.exists() or not mime_p.exists():
-        return None
-    try:
-        mime = mime_p.read_text(encoding="utf-8").strip() or "audio/mpeg"
-        # touch for LRU
-        try: os.utime(audio_p, None)
-        except OSError: get_logger("ai").debug("TTS 缓存 LRU touch 失败: %s", audio_p)
-        return audio_p.read_bytes(), mime
-    except OSError:
-        return None
-
-
-def _tts_cache_put(provider_name: str, text: str, voice: str | None,
-                   speed: float, audio: bytes, mime: str) -> None:
-    try:
-        TTS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        audio_p, mime_p = _tts_cache_paths(provider_name, text, voice, speed)
-        audio_p.write_bytes(audio)
-        mime_p.write_text(mime, encoding="utf-8")
-    except OSError as e:
-        get_logger("ai").warning("TTS 缓存写入失败: %s", e)
-
-
-# Default thresholds — exposed so they can be tuned from a single place
-TTS_CACHE_MAX_AGE_DAYS = 60
-TTS_CACHE_MAX_BYTES    = 500 * 1024 * 1024   # 500 MB
-
-
-def _tts_cleanup(max_age_days: int = TTS_CACHE_MAX_AGE_DAYS,
-                 max_total_bytes: int = TTS_CACHE_MAX_BYTES) -> dict:
-    """Delete TTS cache entries older than max_age_days; then LRU-trim to size cap.
-
-    Each cached item is two files (``.audio`` + ``.mime``). They're managed as
-    a pair so partial deletion never leaves orphans.
-    """
-    if not TTS_CACHE_DIR.exists():
-        return {"removed": 0, "kept": 0, "bytes": 0}
-
-    now = time.time()
-    cutoff = now - max_age_days * 86400
-    entries = []   # [(atime, size, audio_path, mime_path)]
-    removed = 0
-
-    for audio_p in TTS_CACHE_DIR.glob("*.audio"):
-        mime_p = audio_p.with_suffix(".mime")
-        try:
-            st = audio_p.stat()
-        except OSError:
-            continue
-        atime = max(st.st_atime, st.st_mtime)
-        if atime < cutoff:
-            try:
-                audio_p.unlink(missing_ok=True)
-                mime_p.unlink(missing_ok=True)
-                removed += 1
-                continue
-            except OSError as e:
-                get_logger("ai").debug("TTS 缓存清理删除旧文件失败: %s", e)
-        entries.append((atime, st.st_size, audio_p, mime_p))
-
-    # size-cap pass (oldest atime first)
-    entries.sort()
-    total = sum(e[1] for e in entries)
-    i = 0
-    while total > max_total_bytes and i < len(entries):
-        _, size, audio_p, mime_p = entries[i]
-        try:
-            audio_p.unlink(missing_ok=True)
-            mime_p.unlink(missing_ok=True)
-            total -= size
-            removed += 1
-        except OSError as e:
-            get_logger("ai").debug("TTS 缓存清理 size-cap 删除失败: %s", e)
-        i += 1
-
-    kept = max(len(entries) - i, 0)
-    return {"removed": removed, "kept": kept, "bytes": total}
-
 
 @app.post("/api/ai/tts")
 async def api_ai_tts(body: AiTtsBody):
@@ -1277,7 +1008,7 @@ async def api_ai_tts(body: AiTtsBody):
     event loop while other AI requests are in flight.
 
     HOTFIX-MIGRATION-TTS-CLEANUP-V1 Fix C:
-    Normalise the effective text once (cap at _TTS_TEXT_LIMIT_CHARS) so
+    Normalise the effective text once (cap at TtsCache.TEXT_LIMIT_CHARS) so
     cache lookup, provider call, and cache write all hash / synthesise
     the same bytes. Inputs that differ only beyond the cap now collapse
     to a single cache entry instead of wasting storage and missing the
@@ -1287,16 +1018,13 @@ async def api_ai_tts(body: AiTtsBody):
     raw_text = body.text
     if not raw_text.strip():
         raise HTTPException(400, "text 不能为空")
-    tts_text = raw_text[:_TTS_TEXT_LIMIT_CHARS]
+    tts_text = tts_cache.normalize_text(raw_text)
     loop = asyncio.get_running_loop()
 
     # 1) Try local cache first — same text/voice/speed = same audio.
-    #    Wrapped in a lambda so the call site clearly reads
-    #    `_tts_cache_get(provider.name, tts_text, ...)` and so all three
-    #    TTS operations syntactically reference tts_text.
     hit = await loop.run_in_executor(
         None,
-        lambda: _tts_cache_get(provider.name, tts_text, body.voice, body.speed),
+        lambda: tts_cache.get(provider.name, tts_text, body.voice, body.speed),
     )
     if hit is not None:
         audio, mime = hit
@@ -1318,12 +1046,11 @@ async def api_ai_tts(body: AiTtsBody):
     else:
         audio, mime = result, "audio/mpeg"
 
-    # 3) Save to disk for next time (off the event loop). Lambda form
-    #    mirrors the get-side for clarity & validation symmetry.
+    # 3) Save to disk for next time (off the event loop).
     await loop.run_in_executor(
         None,
-        lambda: _tts_cache_put(provider.name, tts_text, body.voice, body.speed,
-                               audio, mime),
+        lambda: tts_cache.put(provider.name, tts_text, body.voice, body.speed,
+                              audio, mime),
     )
 
     return Response(content=audio, media_type=mime,
@@ -1333,21 +1060,12 @@ async def api_ai_tts(body: AiTtsBody):
 @app.get("/api/ai/tts/stats")
 def api_ai_tts_stats():
     """Kept for backwards-compat; the unified /api/cache/stats is preferred."""
-    return _dir_stats(TTS_CACHE_DIR, "*.audio")
+    return tts_cache.stats()
 
 
 @app.post("/api/ai/tts/clear")
 def api_ai_tts_clear():
-    if not TTS_CACHE_DIR.exists():
-        return {"removed": 0}
-    n = 0
-    for f in TTS_CACHE_DIR.iterdir():
-        try:
-            f.unlink()
-            n += 1
-        except OSError as e:
-            get_logger("ai").debug("TTS 缓存清空删除文件失败: %s", e)
-    return {"removed": n}
+    return tts_cache.clear()
 
 
 # ---------- annotations ----------
@@ -1425,7 +1143,7 @@ def api_root_get():
     root = _require_root()
     return {
         "root": str(root),
-        "last_file": _get_last_file(root),
+        "last_file": state_store.get_last_file(root),
         "needs_root": False,
     }
 
@@ -1445,14 +1163,14 @@ def api_root_set(body: RootBody):
         raise HTTPException(400, f"not a directory: {new_path}")
     _stop_background_tasks()
     ROOT = new_path
-    _set_last_root(ROOT)
+    state_store.set_last_root(ROOT)
     # HOTFIX-LOCAL-RESPONSIVENESS-V1 #2:
     # Do NOT clear the search text cache on root change. _text_cache is
     # keyed by absolute path, so entries for the old root cannot collide
     # with the new root. Wiping everything forced a full re-extract of
     # files the user might switch back to. The /api/search/rebuild
     # endpoint remains the explicit "wipe + rebuild" knob.
-    return {"root": str(ROOT), "last_file": _get_last_file(ROOT), "needs_root": False}
+    return {"root": str(ROOT), "last_file": state_store.get_last_file(ROOT), "needs_root": False}
 
 
 def _bring_explorer_to_front_later(target: Path) -> None:
@@ -1718,7 +1436,7 @@ def _request_app_shutdown(reason: str = "api") -> None:
     #    down. Safe to call repeatedly — atexit handlers will no-op on the
     #    re-entry since _state_dirty becomes False after a successful write.
     try:
-        _flush_state(force=True)
+        state_store.flush(force=True)
     except Exception:
         log.exception("state flush during shutdown failed (continuing)")
 
@@ -1764,7 +1482,7 @@ def main():
     log = get_logger("browse")
 
     # Migrate legacy last_root/last_files (used to live in config.json) into state.json
-    _migrate_legacy_state()
+    state_store.migrate_legacy_config()
 
     # Check for existing service BEFORE initializing full state
     if not args.force_server and _is_our_service_running(args.host, args.port):
@@ -1785,14 +1503,14 @@ def main():
     ROOT = _resolve_initial_root(args.root)
     PRECONVERT_ENABLED = not args.no_preconvert
     if _has_root():
-        _set_last_root(_require_root())
+        state_store.set_last_root(_require_root())
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     cleaned = converter.cleanup_cache(CACHE_DIR, max_age_days=30)
     if cleaned["removed"]:
         log.info("PDF cache: 删除 %d 项过期，保留 %d 项 (%.1f MB)",
                  cleaned["removed"], cleaned["kept"], cleaned["bytes"]/1024/1024)
-    tts_cleaned = _tts_cleanup()
+    tts_cleaned = tts_cache.cleanup()
     if tts_cleaned["removed"]:
         log.info("TTS cache: 删除 %d 项过期，保留 %d 项 (%.1f MB)",
                  tts_cleaned["removed"], tts_cleaned["kept"], tts_cleaned["bytes"]/1024/1024)
@@ -1864,7 +1582,7 @@ def main():
     import atexit, signal
     def _on_exit(*_a):
         try:
-            _flush_state(force=True)
+            state_store.flush(force=True)
         except Exception:
             pass
         killed = converter.kill_orphan_soffice()
