@@ -96,7 +96,7 @@ def _data_base_dir() -> Path:
 APP_DIR = _app_base_dir()
 DATA_DIR = _data_base_dir()
 RESOURCE_DIR = _resource_base_dir()
-STATIC_DIR = RESOURCE_DIR / "static"
+STATIC_DIR = RESOURCE_DIR / "src" / "frontend" / "static"
 CACHE_DIR = DATA_DIR / "cache"
 TTS_CACHE_DIR = DATA_DIR / "cache" / "tts"   # hashed TTS audio bytes
 CONFIG_PATH = DATA_DIR / "config.json"   # user-editable: AI, preferences

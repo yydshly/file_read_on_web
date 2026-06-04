@@ -25,8 +25,8 @@ Set-Location $ProjectRoot
 # --- Check required files ---
 $requiredFiles = @(
     "server.py",
-    "static",
-    "static/favicon.ico",
+    "src/frontend/static",
+    "src/frontend/static/favicon.ico",
     "assets/app.ico",
     "config.example.json",
     "README.md"
@@ -86,7 +86,7 @@ $pyArgs = @(
     "--clean",
     "--name", $internalName,
     "--icon", "assets/app.ico",
-    "--add-data", "static;static",
+    "--add-data", "src/frontend/static;src/frontend/static",
     "--hidden-import", "pystray._win32",
     "--hidden-import", "PIL.Image",
     "--hidden-import", "PIL.ImageDraw",
@@ -154,8 +154,8 @@ Write-Host "`n[6/6] Verifying build output..." -ForegroundColor Yellow
 $releaseDir = Join-Path $ProjectRoot "dist\$productName"
 $exePath    = Join-Path $releaseDir "$productName.exe"
 $internalDir = Join-Path $releaseDir "_internal"
-$staticInInternal = Join-Path $internalDir "static"
-$staticInRoot = Join-Path $releaseDir "static"
+$staticInInternal = Join-Path $internalDir "src/frontend/static"
+$staticInRoot = Join-Path $releaseDir "src/frontend/static"
 
 $results = @{
     "release dir exists"           = (Test-Path $releaseDir)
