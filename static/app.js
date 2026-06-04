@@ -1462,6 +1462,18 @@ function _applyAiWidth() {
 _applyAiMode();
 _applyAiWidth();
 
+// HOTFIX-LOCAL-RESPONSIVENESS-V1 #5:
+// Refuse to open the AI text panel on file types it can't help with so the
+// user doesn't waste a click typing then getting a 400. Images need vision
+// (not yet UI-wired); other types are flat-out unsupported by the text flow.
+function _aiFileKindFromPath(path) {
+  if (!path) return null;
+  const ext = ('.' + (path.split('.').pop() || '')).toLowerCase();
+  if (/^\.(jpg|jpeg|png|gif|webp|bmp|svg)$/.test(ext)) return 'image';
+  if (/^\.(pdf|md|txt|log|csv|doc|docx|xls|xlsx|ppt|pptx|odt|ods|odp|rtf)$/.test(ext)) return 'text';
+  return 'other';
+}
+
 async function aiOpenPanel() {
   // Refuse to open if AI not configured — give the user a clear, copyable hint
   if (!aiCanText()) {
@@ -1471,6 +1483,19 @@ async function aiOpenPanel() {
       '2) 设置环境变量 MINIMAX_API_KEY（在 start.bat 加 set ... 或者系统设置）\n' +
       '3) 重启服务'
     );
+    return;
+  }
+  // Cheap, client-side gate before any network round-trip:
+  const kind = _aiFileKindFromPath(currentPath);
+  if (kind === 'image') {
+    alert(
+      '当前是图片。AI 对话/整理只接受文本类文档。\n\n' +
+      '图片需要 vision 单页识别能力，UI 暂未接入（后续会提供 🖼 识别本图 按钮）。'
+    );
+    return;
+  }
+  if (kind === 'other') {
+    alert('当前文件类型 AI 无法处理。仅支持 PDF / Markdown / TXT / Word / Excel / PPT。');
     return;
   }
   aiPanel.hidden = false;

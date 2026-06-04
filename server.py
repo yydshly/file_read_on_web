@@ -133,20 +133,68 @@ def _load_config() -> dict:
 
 
 # ---------- state (auto-managed runtime memory) ----------
+# HOTFIX-LOCAL-RESPONSIVENESS-V1 #4:
+# Previous code did atomic_write_json on every file click (5-50ms each on
+# SSDs, worse on HDD / network drives). We now keep state in memory and
+# debounce-flush to disk on a background timer. atexit + signal handlers
+# guarantee the final state is persisted at shutdown.
+
+_STATE_DEBOUNCE_SECONDS = 0.5
+_state_lock = threading.Lock()
+_state_cache: Optional[dict] = None
+_state_dirty = False
+_state_save_timer: Optional[threading.Timer] = None
+
 
 def _load_state() -> dict:
-    d = read_json(STATE_PATH, default={})
-    return d if isinstance(d, dict) else {}
+    """Return the cached state dict (loaded lazily from disk once)."""
+    global _state_cache
+    with _state_lock:
+        if _state_cache is None:
+            d = read_json(STATE_PATH, default={})
+            _state_cache = d if isinstance(d, dict) else {}
+        return _state_cache
+
+
+def _flush_state(force: bool = False) -> None:
+    """Write the in-memory state to disk if dirty. Safe to call from any
+    thread (including atexit / signal handlers)."""
+    global _state_dirty
+    with _state_lock:
+        if _state_cache is None or (not _state_dirty and not force):
+            return
+        snapshot = dict(_state_cache)
+        _state_dirty = False
+    try:
+        atomic_write_json(STATE_PATH, snapshot)
+    except Exception as e:
+        # Re-mark dirty so the next mutation triggers another attempt.
+        with _state_lock:
+            _state_dirty = True
+        try:
+            get_logger("browse").warning("state flush failed: %s", e)
+        except Exception:
+            pass
+
+
+def _schedule_state_save() -> None:
+    """Debounce: arm a single-shot timer; rapid calls collapse to one write."""
+    global _state_save_timer
+    with _state_lock:
+        if _state_save_timer is not None:
+            _state_save_timer.cancel()
+        _state_save_timer = threading.Timer(_STATE_DEBOUNCE_SECONDS, _flush_state)
+        _state_save_timer.daemon = True
+        _state_save_timer.start()
 
 
 def _save_state(state: dict) -> None:
-    try:
-        atomic_write_json(STATE_PATH, state)
-    except Exception as e:
-        try:
-            get_logger("browse").warning("failed to save state: %s", e)
-        except Exception:
-            pass
+    """Replace the cached state and schedule a debounced disk flush."""
+    global _state_cache, _state_dirty
+    with _state_lock:
+        _state_cache = dict(state)
+        _state_dirty = True
+    _schedule_state_save()
 
 
 def _migrate_legacy_state() -> None:
@@ -200,22 +248,38 @@ def _root_key(root: Path) -> str:
 
 
 def _get_last_file(root: Path) -> Optional[str]:
-    state = _load_state()
-    return (state.get("last_files") or {}).get(_root_key(root))
+    """Read-only; the lock isn't strictly needed because dict.get under CPython
+    is atomic, but we take it briefly for consistency."""
+    key = _root_key(root)
+    with _state_lock:
+        state = _state_cache if _state_cache is not None else _load_state()
+        return (state.get("last_files") or {}).get(key)
 
 
 def _set_last_file(root: Path, rel: str) -> None:
-    state = _load_state()
-    last_files = state.setdefault("last_files", {})
-    last_files[_root_key(root)] = rel
-    state["last_root"] = _root_key(root)
-    _save_state(state)
+    """Atomically update last_files[root] + last_root in memory, then schedule
+    a debounced disk flush."""
+    global _state_dirty
+    if _state_cache is None:
+        _load_state()
+    key = _root_key(root)
+    with _state_lock:
+        last_files = _state_cache.setdefault("last_files", {})  # type: ignore[union-attr]
+        last_files[key] = rel
+        _state_cache["last_root"] = key                          # type: ignore[index]
+        _state_dirty = True
+    _schedule_state_save()
 
 
 def _set_last_root(root: Path) -> None:
-    state = _load_state()
-    state["last_root"] = _root_key(root)
-    _save_state(state)
+    global _state_dirty
+    if _state_cache is None:
+        _load_state()
+    key = _root_key(root)
+    with _state_lock:
+        _state_cache["last_root"] = key                          # type: ignore[index]
+        _state_dirty = True
+    _schedule_state_save()
 
 
 # ---------- path safety ----------
@@ -544,6 +608,12 @@ async def _on_startup():
 @app.on_event("shutdown")
 async def _on_shutdown():
     _stop_background_tasks()
+    # Final flush of debounced state (HOTFIX #4) — never lose the user's
+    # last click just because we shut down before the timer fired.
+    try:
+        _flush_state(force=True)
+    except Exception:
+        pass
 
 
 # ---------- routes ----------
@@ -730,22 +800,37 @@ _AI_TEXT_SOFT_LIMIT_CHARS = 280_000     # ~100K tokens — above this we do summ
 
 
 @app.get("/api/file/ai-eligibility")
-def api_file_ai_eligibility(path: str = Query(...)):
-    """Tell the UI whether AI features apply to this file and why not."""
+async def api_file_ai_eligibility(path: str = Query(...)):
+    """Tell the UI whether AI features apply to this file and why not.
+
+    HOTFIX-LOCAL-RESPONSIVENESS-V1 #1:
+        Now async; pypdf / text extraction is offloaded to the default
+        executor so a big PDF doesn't block the event loop and starve
+        other requests.
+    """
     _require_root()
     src = _safe_resolve(path)
     info = {
         "path": path,
         "supported": True,
-        "mode": "direct",   # direct | summarize_first | unsupported
+        "mode": "direct",   # direct | summarize_first | needs_conversion | vision_required | unsupported
         "reasons": [],
         "char_count": 0,
         "is_scanned": False,
     }
     kind = converter.classify(src)
     if kind == "image":
+        # HOTFIX-LOCAL-RESPONSIVENESS-V1 #5:
+        # Images go through vision, not text chat. The UI used to round-trip
+        # to /api/ai/chat for images and fail late. We now mark them
+        # unsupported here so the front-end can refuse the click with a
+        # clear message before bothering the user with an input box.
+        info["supported"] = False
         info["mode"] = "vision_required"
-        info["reasons"].append("图片需要 vision 能力（未启用时不可用）")
+        info["reasons"].append(
+            "AI 对话/整理只支持文本类文档。图片需要 vision 单页识别（当前 UI 未接入，"
+            "后续会提供 🖼 识别本图 按钮）"
+        )
         return info
     if kind == "unsupported":
         info["supported"] = False
@@ -754,7 +839,11 @@ def api_file_ai_eligibility(path: str = Query(...)):
         return info
 
     if kind in ("pdf", "office", "markdown", "text"):
-        text = search_mod.get_indexed_text(src, CACHE_DIR)
+        # CPU-bound (pypdf extraction); run off the event loop.
+        loop = asyncio.get_running_loop()
+        text = await loop.run_in_executor(
+            None, search_mod.get_indexed_text, src, CACHE_DIR
+        )
         info["char_count"] = len(text)
         if kind == "pdf" and search_mod.is_scanned(src):
             info["supported"] = False
@@ -1128,12 +1217,20 @@ def _tts_cleanup(max_age_days: int = TTS_CACHE_MAX_AGE_DAYS,
 
 @app.post("/api/ai/tts")
 async def api_ai_tts(body: AiTtsBody):
+    """HOTFIX-LOCAL-RESPONSIVENESS-V1 #3:
+    Cache read / write are blocking file IO (audio can be multi-MB).
+    Offload them to the default executor so they don't stall the async
+    event loop while other AI requests are in flight.
+    """
     provider = _ai_require_tts()
     if not body.text.strip():
         raise HTTPException(400, "text 不能为空")
+    loop = asyncio.get_running_loop()
 
     # 1) Try local cache first — same text/voice/speed = same audio.
-    hit = _tts_cache_get(provider.name, body.text, body.voice, body.speed)
+    hit = await loop.run_in_executor(
+        None, _tts_cache_get, provider.name, body.text, body.voice, body.speed
+    )
     if hit is not None:
         audio, mime = hit
         return Response(content=audio, media_type=mime,
@@ -1154,8 +1251,11 @@ async def api_ai_tts(body: AiTtsBody):
     else:
         audio, mime = result, "audio/mpeg"
 
-    # 3) Save to disk for next time.
-    _tts_cache_put(provider.name, body.text, body.voice, body.speed, audio, mime)
+    # 3) Save to disk for next time (off the event loop).
+    await loop.run_in_executor(
+        None, _tts_cache_put, provider.name, body.text, body.voice, body.speed,
+        audio, mime,
+    )
 
     return Response(content=audio, media_type=mime,
                     headers={"X-TTS-Cache": "miss"})
@@ -1267,8 +1367,12 @@ def api_root_set(body: RootBody):
     _stop_background_tasks()
     ROOT = new_path
     _set_last_root(ROOT)
-    # Reset & re-build search index for the new root.
-    search_mod.clear_cache()
+    # HOTFIX-LOCAL-RESPONSIVENESS-V1 #2:
+    # Do NOT clear the search text cache on root change. _text_cache is
+    # keyed by absolute path, so entries for the old root cannot collide
+    # with the new root. Wiping everything forced a full re-extract of
+    # files the user might switch back to. The /api/search/rebuild
+    # endpoint remains the explicit "wipe + rebuild" knob.
     return {"root": str(ROOT), "last_file": _get_last_file(ROOT), "needs_root": False}
 
 
@@ -1658,9 +1762,14 @@ def main():
     elif tray_enabled:
         log.warning("tray_enabled but dependencies unavailable (pystray/Pillow missing)")
 
-    # Ensure orphaned soffice subprocesses are killed on exit
+    # Ensure orphaned soffice subprocesses are killed on exit AND the
+    # debounced state buffer is flushed (HOTFIX-LOCAL-RESPONSIVENESS-V1 #4).
     import atexit, signal
     def _on_exit(*_a):
+        try:
+            _flush_state(force=True)
+        except Exception:
+            pass
         killed = converter.kill_orphan_soffice()
         if killed:
             log.warning("退出时清理 %d 个残留 soffice 进程", killed)
