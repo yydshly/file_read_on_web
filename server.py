@@ -985,7 +985,16 @@ async def _ai_load_document(path: str) -> tuple[Path, str]:
                 422, f"该 office 文件无法转换为 PDF，AI 不可用：{e}"
             )
 
-    text = search_mod.get_indexed_text(src, CACHE_DIR)
+    # HOTFIX (follow-up to HOTFIX-LOCAL-RESPONSIVENESS-V1 #1):
+    # The eligibility endpoint already offloads this call, but /api/ai/summarize
+    # and /api/ai/chat reach text extraction via this function — if the user
+    # invokes AI without first opening the panel (or the in-memory text cache
+    # was cleared), a large uncached PDF would block the event loop for 10-30s
+    # of synchronous pypdf work. Mirror the eligibility fix here.
+    loop = asyncio.get_running_loop()
+    text = await loop.run_in_executor(
+        None, search_mod.get_indexed_text, src, CACHE_DIR
+    )
     if kind == "pdf" and (search_mod.is_scanned(src) or not text.strip()):
         raise HTTPException(
             422,

@@ -375,6 +375,21 @@ async function openFile(node, li) {
     } else if (ct.includes('text/html')) {
       const html = await r.text();
       const f = document.createElement('iframe');
+      // SECURITY: server-rendered Markdown / text is delivered as raw HTML
+      // (the python-markdown library passes through inline <script> / <iframe>
+      // / event handlers by design). The iframe is same-origin to the app
+      // server, so without a sandbox a malicious .md file dropped into the
+      // user's folder could call /api/shutdown, /api/raw, /api/cache/clear,
+      // exfiltrate annotations.json, etc. — purely by being previewed.
+      //
+      // We set `sandbox="allow-same-origin"` BEFORE assigning srcdoc:
+      //   - Without `allow-scripts`, no JS in the document can execute,
+      //     so <script>, on*=, javascript: URLs are all neutralised.
+      //   - With `allow-same-origin`, the parent can still call
+      //     f.contentWindow.scrollTo(...) below for scroll-restore UX.
+      // Order matters: sandbox attributes set after srcdoc do not retroactively
+      // re-sandbox the loaded document in all browsers.
+      f.setAttribute('sandbox', 'allow-same-origin');
       f.srcdoc = html;
       f.addEventListener('load', () => {
         viewerEl.scrollTop = 0;
