@@ -66,7 +66,7 @@ for p in targets:
     b = Path(p).read_bytes()
     assert b.count(b"\x00") == 0, f"NUL bytes in {p}"
     s = b.decode("utf-8-sig")
-    assert "<placeholder>" not in s, f"Placeholder in {p}"
+    assert chr(0xFFFD) not in s, f"Encoding issue in {p}"
 print("TEXT_HEALTH_PASS")
 PY
 ```
@@ -76,7 +76,7 @@ PY
 ```
 [ ] 所有目标文件 UTF-8 可读
 [ ] 无 NUL 字节
-[ ] 无 ??? 乱码占位符
+[ ] 无乱码占位符
 [ ] 无编译错误
 ```
 
@@ -191,6 +191,16 @@ powershell -ExecutionPolicy Bypass -File scripts/package_release_zip.ps1
 [ ] AI 未配置状态友好提示
 ```
 
+### LibreOffice 兼容性补充检查
+
+```
+[ ] 记录测试机 Windows 版本
+[ ] LibreOffice 安装版本与 Windows 版本兼容
+[ ] soffice.exe 路径可定位（SOFFICE_PATH 或 LIBREOFFICE_HOME）
+[ ] 未安装 LibreOffice 时，PDF/图片/Markdown/Text 仍可正常预览
+[ ] 未安装或不可用 LibreOffice 时，Office 预览错误提示友好
+```
+
 ---
 
 ## 9. 生命周期检查
@@ -234,6 +244,25 @@ powershell -ExecutionPolicy Bypass -File scripts/package_release_zip.ps1
 [ ] Git 中无 *.zip
 [ ] Git 中无 dist/ build/ *.exe
 [ ] Git 中无 config.json
+```
+
+---
+
+## 发布实测记录模板
+
+记录每次发布验证的实际结果：
+
+```
+test_date:          # 测试日期，例如 2026-06-04
+tester:             # 测试人
+windows_version:    # Windows 版本，例如 Windows 11 23H2
+python_version:      # Python 版本，例如 3.10.11
+libreoffice_installed: yes / no   # 是否安装了 LibreOffice
+libreoffice_path:    # soffice.exe 路径，未安装则填 N/A
+package_name:        # zip 包名，例如 资料浏览器-v0.1.0-windows-20260604.zip
+extract_path:        # 解压路径，例如 D:\tmp\test_0_1_0
+result: PASS/FAIL   # 综合判定
+notes:               # 其他备注
 ```
 
 ---

@@ -97,6 +97,16 @@ python server.py --no-tray
 
 ---
 
+### 大目录首次加载说明
+
+首次打开很大的资料目录（如数万文件）时，加载可能较慢，原因是文件树扫描、搜索索引预建、Office 文件预热会同时进行。建议首次验证时使用较小的目录。
+
+后续打开同一目录会利用缓存，速度会明显提升。
+
+> 如果首次体验较慢，建议先用小目录（如几十到几百个文件）验证功能是否正常，再用于大目录。
+
+---
+
 ## 配置 AI
 
 AI 功能（如文档整理）需要手动配置：
@@ -119,6 +129,10 @@ Office 文件（`.doc` `.docx` `.xls` `.xlsx` `.ppt` `.pptx`）预览依赖 **Li
 
 PDF、图片、Markdown、Text **不依赖** LibreOffice。
 
+**版本兼容性：**
+
+较新版本的 LibreOffice 安装程序可能要求 Windows 10 或更高版本。如果当前系统为 Windows 7/8/8.1，安装程序会提示"需要 Windows 10 及更高版本"，这是操作系统与 LibreOffice 版本不兼容，不是本应用的问题。此时可尝试安装较旧版 LibreOffice，或在 Windows 10/11 机器上运行本应用。
+
 **推荐安装路径（二选一）：**
 
 ```
@@ -138,6 +152,23 @@ $env:SOFFICE_PATH="D:\software\LibreOffice\program\soffice.exe"
 $env:LIBREOFFICE_HOME="D:\software\LibreOffice"
 ```
 
+> 修改环境变量后需重启应用才能生效。
+
+---
+
+### Office 预览失败排查
+
+如果 Office 文件预览失败，按以下顺序检查：
+
+1. **LibreOffice 未安装？** 确认已安装 LibreOffice，推荐路径见上。
+2. **Windows 版本不兼容？** 较新版 LibreOffice 需要 Windows 10+。
+3. **路径错误？** 确认 `SOFFICE_PATH` 或 `LIBREOFFICE_HOME` 指向 `program\soffice.exe`。
+4. **首次转换慢？** 首次打开 Office 文件需要转换，可能需数秒；再次打开时使用缓存会更快。
+5. **文件损坏或加密？** 部分损坏或加密的 Office 文件可能转换失败。
+6. **缓存过期？** 可在页面"设置"中清除转换缓存后重试。
+
+非 Office 格式（PDF、图片、Markdown、Text）**不依赖** LibreOffice，如果这些格式预览失败，问题不在 LibreOffice。
+
 ---
 
 ## 打包
@@ -155,6 +186,18 @@ dist/资料浏览器/
   app_data/          ← 运行数据
     config.example.json  ← 配置模板
 ```
+
+---
+
+**发布 zip 应在仓库外验证。** 将 zip 解压到 `D:\tmp\` 或其他非项目目录后测试，不要在 `dist/`、`build/`、`release_packages/` 内直接测试。
+
+验证要点：
+- exe 启动无终端窗口 ✓
+- 浏览器自动打开 ✓
+- 托盘图标出现 ✓
+- 关闭浏览器后服务仍在 ✓
+- 托盘"退出"完全停止服务 ✓
+- zip 中不包含 `config.json` ✓
 
 ---
 
@@ -236,6 +279,22 @@ A: 程序会尽量前置资源管理器窗口，如果被系统阻止，请查�
 **Q: 重复双击 exe 为什么没有反应？**
 
 A: 程序检测到已有服务运行，会自动打开已有浏览器页面，不会启动第二个服务。
+
+**Q: LibreOffice 安装时提示需要 Windows 10 以上怎么办？**
+
+A: 较新版 LibreOffice 需要 Windows 10/11。如果系统是 Windows 7/8/8.1，可尝试安装较旧版 LibreOffice，或在 Windows 10+ 机器上运行本应用。
+
+**Q: 没装 LibreOffice 还能用吗？**
+
+A: 可以。PDF、图片、Markdown、Text 预览不依赖 LibreOffice。只有 Office 文件（doc/docx/xls/xlsx/ppt/pptx）才需要 LibreOffice。
+
+**Q: 为什么第一次打开大目录比较慢？**
+
+A: 首次打开大目录时，文件树扫描、搜索索引预建、Office 文件预热会同时进行。建议首次验证使用较小的目录，后续会明显加快。
+
+**Q: 发布 zip 应该在哪里测试？**
+
+A: 应将 zip 解压到仓库外的目录（如 `D:\tmp\`）进行测试，不要在 `dist/`、`build/`、`release_packages/` 内直接运行。
 
 ---
 
