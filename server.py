@@ -198,49 +198,57 @@ def _save_state(state: dict) -> None:
 
 
 def _migrate_legacy_state() -> None:
-    """Older versions kept last_root / last_files inside config.json. If we
-    see them there (and state.json hasn't been initialised), move them out so
-    config.json becomes purely user-edited.
+    """Import legacy ``last_root`` / ``last_files`` keys from ``config.json``
+    into the runtime-managed ``state.json``.
 
-    Migration is idempotent and runs only once (gated by state.json existence).
+    HOTFIX-MIGRATION-TTS-CLEANUP-V1 Fix B:
+        Migration is now **state-only** — it never writes ``config.json``.
+        config.json is the user-editable configuration file and must not be
+        automatically rewritten by the server. The legacy keys, if present
+        in config.json, are simply ignored at runtime once state.json
+        exists. This preserves the strict
+            config.json = user-editable
+            state.json  = auto-managed
+        contract and removes the previous 500ms race window where
+        config.json would be rewritten while state.json was only
+        scheduled (debounced) to be written.
+
+    Migration is idempotent: it runs only when state.json does not yet
+    exist, and on failure leaves config.json untouched so the next
+    startup can retry cleanly.
     """
     if STATE_PATH.exists():
         return
     cfg = _load_config()
-    legacy_keys = {"last_root", "last_files"}
-    moved = {k: cfg.pop(k) for k in list(cfg.keys()) if k in legacy_keys}
+    if not isinstance(cfg, dict):
+        return
+
+    # Read (do NOT mutate) legacy keys from cfg.
+    moved: dict = {}
+    if "last_root" in cfg:
+        moved["last_root"] = cfg["last_root"]
+    if "last_files" in cfg:
+        moved["last_files"] = cfg["last_files"]
     if not moved:
         return
 
-    # 1. Persist the runtime state.
+    # 1. Stage state in memory + schedule debounced flush.
     _save_state(moved)
+    # 2. Force-flush so the migration is durable before we report success.
+    #    If this fails state.json may not exist; we then leave config.json
+    #    alone so the next startup can retry.
+    _flush_state(force=True)
 
-    # 2. Rewrite config.json without the migrated keys so the user sees a
-    #    clean file. Their other keys (ai, future preferences) are kept.
-    #    If config.json ends up empty, write a hint pointing at the example.
-    if not cfg:
-        cfg = {
-            "_doc": (
-                "本文件用于用户偏好（AI 等）。运行时记忆（上次目录、上次文件）"
-                "在同目录的 state.json 自动管理。配置模板见 config.example.json。"
-            )
-        }
-    try:
-        atomic_write_json(CONFIG_PATH, cfg)
-    except Exception as e:
-        try:
-            get_logger("browse").warning(
-                "migration: 无法回写 config.json，旧字段仍残留: %s", e
-            )
-        except Exception:
-            pass
-
-    try:
-        get_logger("browse").info(
-            "迁移：last_root / last_files 已从 config.json 移到 state.json"
+    log = get_logger("browse")
+    if STATE_PATH.exists():
+        log.info(
+            "迁移：legacy last_root / last_files 已导入 state.json；"
+            "config.json 中旧字段将被忽略"
         )
-    except Exception:
-        pass
+    else:
+        log.warning(
+            "迁移：state.json 落盘失败，config.json 保持不变以便下次启动重试"
+        )
 
 
 def _root_key(root: Path) -> str:
@@ -1131,6 +1139,16 @@ async def api_ai_chat(body: AiChatBody):
     return {"answer": full}
 
 
+# HOTFIX-MIGRATION-TTS-CLEANUP-V1 Fix C:
+# Single server-side cap for the text length we actually synthesise.
+# All three operations — cache lookup, provider invocation, and cache write —
+# must use the same effective text. Without this, two distinct inputs whose
+# first 5000 chars are identical produce identical audio but populate
+# different cache entries (waste) or, worse, never match in cache (miss
+# storm). Provider modules also truncate internally; this constant matches.
+_TTS_TEXT_LIMIT_CHARS = 5000
+
+
 def _tts_cache_paths(provider_name: str, text: str, voice: str | None,
                      speed: float) -> tuple[Path, Path]:
     """Return (audio_path, mime_meta_path) for a given TTS request.
@@ -1236,15 +1254,28 @@ async def api_ai_tts(body: AiTtsBody):
     Cache read / write are blocking file IO (audio can be multi-MB).
     Offload them to the default executor so they don't stall the async
     event loop while other AI requests are in flight.
+
+    HOTFIX-MIGRATION-TTS-CLEANUP-V1 Fix C:
+    Normalise the effective text once (cap at _TTS_TEXT_LIMIT_CHARS) so
+    cache lookup, provider call, and cache write all hash / synthesise
+    the same bytes. Inputs that differ only beyond the cap now collapse
+    to a single cache entry instead of wasting storage and missing the
+    cache.
     """
     provider = _ai_require_tts()
-    if not body.text.strip():
+    raw_text = body.text
+    if not raw_text.strip():
         raise HTTPException(400, "text 不能为空")
+    tts_text = raw_text[:_TTS_TEXT_LIMIT_CHARS]
     loop = asyncio.get_running_loop()
 
     # 1) Try local cache first — same text/voice/speed = same audio.
+    #    Wrapped in a lambda so the call site clearly reads
+    #    `_tts_cache_get(provider.name, tts_text, ...)` and so all three
+    #    TTS operations syntactically reference tts_text.
     hit = await loop.run_in_executor(
-        None, _tts_cache_get, provider.name, body.text, body.voice, body.speed
+        None,
+        lambda: _tts_cache_get(provider.name, tts_text, body.voice, body.speed),
     )
     if hit is not None:
         audio, mime = hit
@@ -1253,7 +1284,7 @@ async def api_ai_tts(body: AiTtsBody):
 
     # 2) Cache miss — call the provider.
     try:
-        result = await provider.tts(body.text, voice=body.voice, speed=body.speed)
+        result = await provider.tts(tts_text, voice=body.voice, speed=body.speed)
     except CapabilityNotSupported as e:
         raise HTTPException(400, str(e))
     except Exception as e:
@@ -1266,10 +1297,12 @@ async def api_ai_tts(body: AiTtsBody):
     else:
         audio, mime = result, "audio/mpeg"
 
-    # 3) Save to disk for next time (off the event loop).
+    # 3) Save to disk for next time (off the event loop). Lambda form
+    #    mirrors the get-side for clarity & validation symmetry.
     await loop.run_in_executor(
-        None, _tts_cache_put, provider.name, body.text, body.voice, body.speed,
-        audio, mime,
+        None,
+        lambda: _tts_cache_put(provider.name, tts_text, body.voice, body.speed,
+                               audio, mime),
     )
 
     return Response(content=audio, media_type=mime,
@@ -1691,12 +1724,16 @@ def main():
                         help="disable system tray")
     args = parser.parse_args()
 
-    # Migrate legacy last_root/last_files (used to live in config.json) into state.json
+    # HOTFIX-MIGRATION-TTS-CLEANUP-V1 Fix A:
+    # Initialize logging BEFORE legacy state migration runs, so any migration
+    # warnings / info land in app.log. This matters most in PyInstaller
+    # --noconsole builds where stderr may be unavailable.
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    _migrate_legacy_state()
-
     log_dir = init_logging(DATA_DIR)
     log = get_logger("browse")
+
+    # Migrate legacy last_root/last_files (used to live in config.json) into state.json
+    _migrate_legacy_state()
 
     # Check for existing service BEFORE initializing full state
     if not args.force_server and _is_our_service_running(args.host, args.port):
