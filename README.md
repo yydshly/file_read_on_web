@@ -98,11 +98,27 @@ search_index.json
 
 ## 打包建议
 
-第一版建议使用 PyInstaller 的目录模式：
+### 推荐：使用打包脚本
+
+正式打包请使用项目提供的脚本（自动包含 `--noconsole`）：
+
+```powershell
+# 方式一：PowerShell 直接运行
+powershell -ExecutionPolicy Bypass -File scripts/build_windows.ps1
+
+# 方式二：双击运行（自动调用 PowerShell）
+scripts\build_windows.bat
+```
+
+首次运行如果提示 PyInstaller 未安装，请先执行：
 
 ```powershell
 python -m pip install pyinstaller
+```
 
+### 手动打包命令（供参考）
+
+```powershell
 # 开发调试（显示终端）
 pyinstaller `
   --onedir `
@@ -111,7 +127,7 @@ pyinstaller `
   --add-data "static;static" `
   server.py
 
-# 正式分发（无终端）
+# 正式分发（无终端）- 脚本已自动包含这些参数
 pyinstaller `
   --onedir `
   --noconsole `
@@ -121,19 +137,34 @@ pyinstaller `
   server.py
 ```
 
-生成目录：
+### 打包产物结构
 
 ```text
 dist/资料浏览器/
+  资料浏览器.exe      ← 主程序（无终端）
+  _internal/         ← 运行时文件
+  app_data/          ← 运行数据目录
+    config.example.json  ← 配置模板（AI 等配置参考此文件）
 ```
 
-`start.bat` 是开发调试入口，会显示终端。
-正式分发 exe 使用 `--noconsole`，不显示终端窗口。
-无终端模式下日志写入 `app_data/logs/app.log`。
+### 配置文件说明
 
-可以将该目录压缩后分发给用户。
+`app_data/config.example.json` 是配置模板。如需启用 AI 功能，将其复制为 `app_data/config.json` 并填入 key。
 
-打包版会优先把运行数据写入程序目录下的 `app_data/`，包括配置、收藏、缓存和搜索索引。迁移到新电脑时，连同 `app_data/` 一起复制即可；如果程序目录不可写，会自动改写到当前用户的本地应用数据目录。
+**注意**：不要将真实的 `config.json`（包含 API key）打包发布。
+
+### 开发模式 vs 正式模式
+
+| | 开发模式 | 正式打包 |
+|---|---------|---------|
+| 启动方式 | `python server.py` 或 `start.bat` | 双击 `资料浏览器.exe` |
+| 终端窗口 | 显示 | **不显示** |
+| 日志文件 | `logs/app.log` | `app_data/logs/app.log` |
+| 重复启动 | 可能端口冲突 | 自动复用已有服务 |
+
+### 迁移说明
+
+打包版会把运行数据写入程序目录下的 `app_data/`。迁移到新电脑时，连同 `app_data/` 一起复制即可；如果程序目录不可写，会自动改写到当前用户的本地应用数据目录。
 
 ## 打包 LibreOffice
 
