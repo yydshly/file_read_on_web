@@ -484,15 +484,36 @@ pickBtn.addEventListener('click', async () => {
 
 revealBtn.addEventListener('click', async () => {
   if (!currentPath) return;
+  const oldText = revealBtn.textContent.trim();
+  revealBtn.disabled = true;
+  revealBtn.textContent = '打开中…';
   try {
     const r = await fetch('/api/reveal', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ path: currentPath }),
     });
-    if (!r.ok) alert('打开本地位置失败：' + await apiErrorText(r));
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || data.ok === false) {
+      throw new Error((data && data.detail) || (data && data.message) || '打开位置失败');
+    }
+    revealBtn.textContent = '已打开';
+    // Use title attribute to hint at taskbar when Explorer is not in front
+    revealBtn.title = '已打开资源管理器，如未看到请查看任务栏。';
+    // If page has a status function, use it
+    if (typeof setStatus === 'function') {
+      setStatus('已打开资源管理器，如未看到请查看任务栏。');
+    }
+    setTimeout(() => {
+      revealBtn.textContent = oldText;
+      revealBtn.title = oldText;
+    }, 1600);
   } catch (err) {
+    revealBtn.textContent = oldText;
+    revealBtn.title = oldText;
     alert('打开本地位置失败：' + (err.message || err));
+  } finally {
+    setTimeout(() => { revealBtn.disabled = false; }, 300);
   }
 });
 

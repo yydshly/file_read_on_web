@@ -1272,10 +1272,52 @@ def api_root_set(body: RootBody):
     return {"root": str(ROOT), "last_file": _get_last_file(ROOT), "needs_root": False}
 
 
+def _bring_explorer_to_front_later(target: Path) -> None:
+    """Best-effort Windows Explorer foreground on a background thread.
+
+    Uses ctypes to find and restore/foreground the most recently active
+    Explorer window (CabinetWClass or ExploreWClass).  Does not block,
+    does not raise, and logs outcomes.
+    """
+    if not sys.platform.startswith("win"):
+        return
+
+    def _run():
+        try:
+            import ctypes
+            import time
+            time.sleep(0.8)
+
+            user32 = ctypes.windll.user32
+            SW_RESTORE = 9
+
+            for class_name in ("CabinetWClass", "ExploreWClass"):
+                hwnd = user32.FindWindowW(class_name, None)
+                if hwnd:
+                    user32.ShowWindow(hwnd, SW_RESTORE)
+                    user32.SetForegroundWindow(hwnd)
+                    get_logger("browse").info(
+                        "已请求前置资源管理器窗口: %s", target
+                    )
+                    return
+
+            get_logger("browse").info(
+                "未找到可前置的资源管理器窗口: %s", target
+            )
+        except Exception as e:
+            get_logger("browse").warning(
+                "前置资源管理器窗口失败: %s", e
+            )
+
+    threading.Thread(target=_run, daemon=True, name="ExplorerForeground").start()
+
+
 @app.post("/api/reveal")
 def api_reveal(body: RootBody):
     """Show the file in the OS file manager (Explorer / Finder / xdg-open)."""
     src = _safe_resolve(body.path)
+    log = get_logger("browse")
+    foreground_attempted = False
     try:
         if sys.platform.startswith("win"):
             # explorer /select,"<path>" must be passed as ONE command-line
@@ -1284,13 +1326,23 @@ def api_reveal(body: RootBody):
             # falling back to its default folder.
             win_path = str(src).replace("/", "\\")
             subprocess.Popen(f'explorer /select,"{win_path}"')
+            _bring_explorer_to_front_later(src)
+            foreground_attempted = True
+            log.info("打开本地位置: %s", src)
         elif sys.platform == "darwin":
             subprocess.Popen(["open", "-R", str(src)])
+            log.info("打开本地位置: %s", src)
         else:
             subprocess.Popen(["xdg-open", str(src.parent)])
+            log.info("打开本地位置: %s", src)
     except Exception as e:
         raise HTTPException(500, f"reveal failed: {e}")
-    return {"ok": True}
+    return {
+        "ok": True,
+        "path": str(src),
+        "parent": str(src.parent),
+        "foreground_attempted": foreground_attempted,
+    }
 
 
 @app.post("/api/shutdown")
