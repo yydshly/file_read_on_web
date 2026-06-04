@@ -1,11 +1,9 @@
-﻿<#
+<#
 .SYNOPSIS
-    Build the packaged Windows exe for 资料浏览器.
-
+    Build the packaged Windows exe for the file browser app.
 .DESCRIPTION
-    This script builds a reproducible --noconsole PyInstaller package.
+    Builds a reproducible --noconsole PyInstaller package.
     Run from any directory; must be called with -ExecutionPolicy Bypass.
-
 .EXAMPLE
     powershell -ExecutionPolicy Bypass -File scripts/build_windows.ps1
 #>
@@ -77,13 +75,16 @@ foreach ($t in $cleanupTargets) {
 # --- Run PyInstaller to a temp ASCII-named directory ---
 Write-Host "`n[4/6] Running PyInstaller (--noconsole)..." -ForegroundColor Yellow
 
-$asciiName = "ziliao_build"
+# Internal ASCII name: avoids PyInstaller + non-ASCII path issues.
+# Final published output uses the Chinese name (managed by Python helper).
+$internalName = "resource_browser_build"
+
 $pyArgs = @(
     "--onedir",
     "--noconsole",
     "--noconfirm",
     "--clean",
-    "--name", $asciiName,
+    "--name", $internalName,
     "--icon", "assets/app.ico",
     "--add-data", "static;static",
     "server.py"
@@ -97,33 +98,37 @@ if ($LASTEXITCODE -ne 0) {
 }
 Write-Host "  Build completed" -ForegroundColor Green
 
-# --- Use Python for reliable copy/rename to Chinese-named directory ---
+# --- Use Python helper for copy/rename to Chinese-named directory ---
 Write-Host "`n[5/6] Setting up output directory..." -ForegroundColor Yellow
 
-$pythonCode = @"
-import shutil, os, sys
-src = r'$ProjectRoot\dist\$asciiName'
-dst = r'$ProjectRoot\dist\ziliao'
-if os.path.exists(dst):
-    shutil.rmtree(dst)
-shutil.copytree(src, dst)
-ascii_exe = os.path.join(dst, '$asciiName.exe')
-chinese_exe = os.path.join(dst, '资料浏览器.exe')
-if os.path.exists(ascii_exe):
-    os.rename(ascii_exe, chinese_exe)
-    print('Renamed: $asciiName.exe -> 资料浏览器.exe')
-print('Copied to:', dst)
-"@
-
-python -c $pythonCode
+# Python helper has the Chinese name hardcoded internally, prints it as last line.
+# PowerShell captures stdout; take the last non-empty line to get the product name.
+$output = & python (Join-Path $ScriptDir "_build_copy.py") $ProjectRoot $internalName
+$lines = @($output -split "`n" | Where-Object { $_ -and $_.Trim() })
+if ($lines.Count -eq 0) {
+    Write-Host "ERROR: Python helper produced no output" -ForegroundColor Red
+    exit 1
+}
+$productName = $lines[-1].Trim()
+if (-not $productName) {
+    Write-Host "ERROR: Python helper did not return product name" -ForegroundColor Red
+    exit 1
+}
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "ERROR: Python copy/rename failed" -ForegroundColor Red
     exit 1
 }
 
+# Remove the internal build directory now that we have copied
+$internalBuiltDir = Join-Path $ProjectRoot "dist\$internalName"
+if (Test-Path $internalBuiltDir) {
+    Remove-Item -Recurse -Force $internalBuiltDir
+    Write-Host "  Cleaned up internal build dir: $internalName" -ForegroundColor Gray
+}
+
 # --- Create app_data subdirectory and copy config.example.json ---
-$appDataDir = Join-Path $ProjectRoot "dist/ziliao/app_data"
+$appDataDir = Join-Path $ProjectRoot "dist\$productName\app_data"
 if (-not (Test-Path $appDataDir)) {
     New-Item -ItemType Directory -Path $appDataDir -Force | Out-Null
     Write-Host "  Created: app_data/" -ForegroundColor Gray
@@ -143,45 +148,30 @@ if (Test-Path $realConfig) {
 # --- Verify output ---
 Write-Host "`n[6/6] Verifying build output..." -ForegroundColor Yellow
 
-$dstDir = Join-Path $ProjectRoot "dist/ziliao"
-$exePath = Join-Path $dstDir "ziliao.exe"
-$internalDir = Join-Path $dstDir "_internal"
+$releaseDir = Join-Path $ProjectRoot "dist\$productName"
+$exePath    = Join-Path $releaseDir "$productName.exe"
+$internalDir = Join-Path $releaseDir "_internal"
 $staticInInternal = Join-Path $internalDir "static"
-$staticInRoot = Join-Path $dstDir "static"
+$staticInRoot = Join-Path $releaseDir "static"
 
 $results = @{
-    "exe exists"            = (Test-Path $exePath)
-    "_internal exists"       = (Test-Path $internalDir)
-    "app_data exists"       = (Test-Path $appDataDir)
-    "config.example copied"  = (Test-Path $dstConfig)
-    "static bundled"        = ((Test-Path $staticInInternal) -or (Test-Path $staticInRoot))
-    "real config.json copied" = (Test-Path $realConfig)
+    "release dir exists"           = (Test-Path $releaseDir)
+    "exe exists"                   = (Test-Path $exePath)
+    "_internal exists"             = (Test-Path $internalDir)
+    "app_data exists"              = (Test-Path $appDataDir)
+    "config.example copied"        = (Test-Path $dstConfig)
+    "static bundled"               = ((Test-Path $staticInInternal) -or (Test-Path $staticInRoot))
+    "real config.json excluded"    = -not (Test-Path $realConfig)
+    "no internal exe leaked"       = -not (Test-Path (Join-Path $releaseDir "$internalName.exe"))
 }
 
-# For "real config.json copied", false is GOOD (means we did not leak it)
 $allOk = $true
 foreach ($key in $results.Keys) {
     $val = $results[$key]
-    if ($key -eq "real config.json copied") {
-        # For this key, false = good (no leak), true = bad (leaked)
-        $color = if ($val) { "Red" } else { "Green" }
-        $statusStr = if ($val) { "true (BAD - leaked!)" } else { "false (good - not leaked)" }
-        if ($val) { $allOk = $false }
-    } else {
-        $color = if ($val) { "Green" } else { "Red" }
-        $statusStr = if ($val) { "true" } else { "false" }
-        if (-not $val) { $allOk = $false }
-    }
+    $color = if ($val) { "Green" } else { "Red" }
+    $statusStr = if ($val) { "OK" } else { "FAIL" }
+    if (-not $val) { $allOk = $false }
     Write-Host ("  {0}: {1}" -f $key, $statusStr) -ForegroundColor $color
-}
-
-Write-Host "`nBuild result:" -ForegroundColor Cyan
-foreach ($key in $results.Keys) {
-    if ($key -eq "real config.json copied") {
-        Write-Host ("  - {0}: {1}" -f $key, $(if ($results[$key]) { "true" } else { "false" }))
-    } else {
-        Write-Host ("  - {0}: {1}" -f $key, $(if ($results[$key]) { "true" } else { "false" }))
-    }
 }
 
 if (-not $allOk) {
@@ -189,6 +179,5 @@ if (-not $allOk) {
     exit 1
 }
 
-Write-Host "`nBuild complete! Output: dist/ziliao/" -ForegroundColor Cyan
-Write-Host "Rename 'ziliao' to Chinese name manually if desired." -ForegroundColor Gray
-Write-Host "Next: distribute the 'dist/ziliao/' directory." -ForegroundColor Gray
+Write-Host "`nBuild complete! Output: dist\$productName\" -ForegroundColor Cyan
+Write-Host "Start: dist\$productName\$productName.exe" -ForegroundColor Cyan

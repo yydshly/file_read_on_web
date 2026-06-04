@@ -43,10 +43,15 @@ def init_logging(data_dir: Path, level: int = logging.INFO) -> Path:
     file_handler.setLevel(level)
     root.addHandler(file_handler)
 
-    console = logging.StreamHandler(sys.stdout)
-    console.setFormatter(fmt)
-    console.setLevel(level)
-    root.addHandler(console)
+    # Only add a console handler when stdout is available and functional.
+    # In --noconsole / PyInstaller frozen mode sys.stdout may be None,
+    # and even when set the TTY check (isatty) can fail.
+    stream = getattr(sys, "stdout", None)
+    if stream is not None and hasattr(stream, "write"):
+        console = logging.StreamHandler(stream)
+        console.setFormatter(fmt)
+        console.setLevel(level)
+        root.addHandler(console)
 
     # Silence the most chatty libraries
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)

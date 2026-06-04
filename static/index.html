@@ -11,10 +11,12 @@
 <div id="app">
   <aside id="sidebar">
     <div class="sidebar-head">
-      <div class="row">
+      <div class="row sidebar-title-row">
         <strong>资料浏览器</strong>
-        <button id="pick-root" type="button" title="切换根目录">切换</button>
-        <button id="shutdown-btn" type="button" title="退出后台服务">退出程序</button>
+        <button id="shutdown-btn" type="button" title="退出后台服务">退出</button>
+      </div>
+      <div class="row sidebar-root-actions">
+        <button id="pick-root" type="button" title="切换资料目录">切换资料目录</button>
       </div>
       <div id="root-path" class="root-path" title=""></div>
       <input id="filter" type="search" placeholder="筛选文件名...">

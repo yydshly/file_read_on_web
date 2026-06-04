@@ -32,6 +32,19 @@ from ai import tasks as ai_tasks
 from ai import factory as ai_factory
 from ai.base import Message as AIMessage, CapabilityNotSupported, ProviderConfigError
 
+def _ensure_stdio_for_noconsole() -> None:
+    """PyInstaller --noconsole may set stdout/stderr to None.
+
+    Some logging formatters, including uvicorn defaults, expect file-like
+    streams and call .isatty(). Provide safe devnull streams before logging
+    and uvicorn setup.
+    """
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w", encoding="utf-8", errors="replace")
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w", encoding="utf-8", errors="replace")
+
+
 def _app_base_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).parent.resolve()
@@ -1400,6 +1413,7 @@ def _delayed_exit(delay: float = 0.6):
 
 
 def main():
+    _ensure_stdio_for_noconsole()
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", default=None, help="initial root directory (overrides saved config)")
     parser.add_argument("--port", type=int, default=8770)
@@ -1496,7 +1510,7 @@ def main():
         pass
 
     import uvicorn
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="info", log_config=None)
 
 
 if __name__ == "__main__":
