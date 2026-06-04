@@ -301,6 +301,7 @@ async function openFile(node, li) {
   // situation so the user knows why it's slow.
   const isOffice = /\.(doc|docx|xls|xlsx|ppt|pptx|odt|ods|odp|rtf)$/i.test(node.path);
   let pollTimer = null;
+  let officeHintTimer = null;
   if (isOffice) {
     const loadingDiv = viewerEl.querySelector('.loading');
     const updateLoading = async () => {
@@ -314,8 +315,10 @@ async function openFile(node, li) {
         }
       } catch {}
     };
-    updateLoading();
-    pollTimer = setInterval(updateLoading, 1500);
+    officeHintTimer = setTimeout(() => {
+      updateLoading();
+      pollTimer = setInterval(updateLoading, 1500);
+    }, 900);
   }
 
   const url = '/api/file?path=' + encodeURIComponent(node.path);
@@ -365,6 +368,7 @@ async function openFile(node, li) {
   } catch (err) {
     viewerEl.innerHTML = `<div class="error-box">请求出错：${escapeHtml(String(err))}</div>`;
   } finally {
+    if (officeHintTimer) clearTimeout(officeHintTimer);
     if (pollTimer) clearInterval(pollTimer);
   }
 }
@@ -1201,7 +1205,7 @@ function aiClearConv() {
   aiConversation = [];
 }
 
-async function aiStream(url, payload, onDelta) {
+async function aiStream(url, payload, onDelta, onEvent = null) {
   const r = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -1227,6 +1231,7 @@ async function aiStream(url, payload, onDelta) {
       if (data === '[DONE]') return;
       try {
         const obj = JSON.parse(data);
+        if (onEvent) onEvent(obj);
         if (obj.delta) onDelta(obj.delta);
         if (obj.error) throw new Error(obj.error);
       } catch (e) {
@@ -1285,21 +1290,31 @@ async function aiSendQuestion() {
 
 async function aiDoSummarize() {
   if (aiBusy || !currentPath) return;
+  if (scannedPaths && scannedPaths.has(currentPath)) {
+    aiAppendMessage('assistant', '\u8fd9\u662f\u626b\u63cf\u7248 PDF\uff0c\u6ca1\u6709\u53ef\u63d0\u53d6\u7684\u6587\u672c\u5c42\uff0c\u6682\u4e0d\u652f\u6301 AI \u6574\u7406\u3002\u53ef\u5148\u901a\u8fc7 OCR \u8f6c\u6210\u53ef\u590d\u5236\u6587\u672c\u540e\u518d\u4f7f\u7528\u3002');
+    return;
+  }
   if (!(await ensureEligible())) return;
-  const { el, body } = aiAppendMessage('assistant', '', { streaming: true });
+  const { el, body } = aiAppendMessage('assistant', '\u51c6\u5907\u6574\u7406\u672c\u6587\u6863...', { streaming: true });
   aiBusy = true; aiSummarize.disabled = true;
   let acc = '';
+  let stage = '';
   try {
     await aiStream('/api/ai/summarize', {
       path: currentPath, stream: true, force: false,
     }, (d) => {
       acc += d;
       aiUpdateStreaming(body, acc);
+    }, (evt) => {
+      if (evt.stage) {
+        stage = evt.stage;
+        if (!acc) aiUpdateStreaming(body, stage + '...');
+      }
     });
     aiFinalizeStreaming(body);
-    aiConversation.push({ role: 'assistant', content: acc });
+    if (acc) aiConversation.push({ role: 'assistant', content: acc });
   } catch (err) {
-    body.dataset.raw = '⚠ ' + (err.message || err);
+    body.dataset.raw = '\u26a0 ' + (stage ? stage + '\n' : '') + (err.message || err);
     body.innerHTML = `<p>${escapeHtml(body.dataset.raw)}</p>`;
   } finally {
     el.classList.remove('streaming');

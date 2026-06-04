@@ -239,6 +239,33 @@ def _build_tree(d: Path, recursive: bool = True) -> dict:
     return {"name": d.name, "path": "", "type": "dir", "children": children}
 
 
+def _iter_files_in_tree_order(d: Path):
+    """Yield files in the same visual order as the left tree."""
+    try:
+        entries = sorted(
+            d.iterdir(),
+            key=lambda p: (not p.is_dir(), p.name.lower()),
+        )
+    except (OSError, PermissionError):
+        return
+
+    skip_roots = {CACHE_DIR.resolve(), STATIC_DIR.resolve()}
+    for entry in entries:
+        name = entry.name
+        if name.startswith(".") or name in _SKIP_NAMES:
+            continue
+        try:
+            resolved = entry.resolve()
+        except OSError:
+            continue
+        if resolved in skip_roots:
+            continue
+        if entry.is_dir():
+            yield from _iter_files_in_tree_order(entry)
+        else:
+            yield entry
+
+
 # ---------- preconvert (background) ----------
 
 def _scan_office_files(root: Path) -> list[Path]:
@@ -382,13 +409,7 @@ def _warm_office_candidates(root: Path, limit: int = 2) -> list[Path]:
     so we scan all files in sorted order and look for office files coming
     after the anchor's position.
     """
-    all_files: list[Path] = []
-    for dirpath, dirnames, filenames in os.walk(root):
-        dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in _SKIP_NAMES]
-        for name in sorted(filenames, key=str.lower):
-            if name.startswith("."):
-                continue
-            all_files.append(Path(dirpath) / name)
+    all_files = list(_iter_files_in_tree_order(root))
 
     last = _get_last_file(root)
     start = 0
@@ -783,6 +804,12 @@ async def _ai_load_document(path: str) -> tuple[Path, str]:
             )
 
     text = search_mod.get_indexed_text(src, CACHE_DIR)
+    if kind == "pdf" and (search_mod.is_scanned(src) or not text.strip()):
+        raise HTTPException(
+            422,
+            "扫描版 PDF 没有可提取的文本层，暂不支持 AI 整理 / 对话。"
+            "请先通过 OCR 转成可复制文本后再使用。",
+        )
     if not text.strip():
         raise HTTPException(422, "文档尚未索引到文本（预转换 / 索引可能还没跑完）")
     if len(text) > _AI_TEXT_HARD_LIMIT_CHARS:
@@ -840,9 +867,14 @@ def _sse_stream(token_iter):
     """Wrap an async iterator of text deltas in Server-Sent-Events frames."""
     async def gen():
         try:
-            async for delta in token_iter:
-                if not delta:
+            async for item in token_iter:
+                if not item:
                     continue
+                if isinstance(item, dict):
+                    payload = json.dumps(item, ensure_ascii=False)
+                    yield f"data: {payload}\n\n"
+                    continue
+                delta = item
                 payload = json.dumps({"delta": delta}, ensure_ascii=False)
                 yield f"data: {payload}\n\n"
             yield "data: [DONE]\n\n"
@@ -856,35 +888,48 @@ def _sse_stream(token_iter):
 @app.post("/api/ai/summarize")
 async def api_ai_summarize(body: AiSummarizeBody):
     provider = _ai_require_text()
-    src, text = await _ai_load_document(body.path)
-    rel = body.path
-    # Cached summary in annotations?
-    if not body.force:
-        anno = anno_store.get(ROOT, rel)
-        cached = (anno or {}).get("ai_summary")
-        if cached:
-            if body.stream:
-                async def replay():
-                    yield cached
-                return _sse_stream(replay())
-            return {"summary": cached, "cached": True}
 
-    async def run():
+    async def run_stream():
+        yield {"stage": "准备文档"}
+        src, text = await _ai_load_document(body.path)
+        rel = body.path
+
+        if not body.force:
+            yield {"stage": "检查已生成摘要"}
+            anno = anno_store.get(ROOT, rel)
+            cached = (anno or {}).get("ai_summary")
+            if cached:
+                yield {"stage": "使用已生成摘要", "cached": True}
+                yield cached
+                return
+
+        yield {"stage": "AI 正在整理文档"}
         chunks = []
         async for d in ai_tasks.summarize_document(provider, src.name, text):
             chunks.append(d)
             yield d
-        # persist after generation
+
         full = "".join(chunks).strip()
         if full:
+            yield {"stage": "保存生成结果"}
             anno_store.patch(ROOT, rel, {"ai_summary": full})
 
     if body.stream:
-        return _sse_stream(run())
+        return _sse_stream(run_stream())
+
+    src, text = await _ai_load_document(body.path)
+    rel = body.path
+    if not body.force:
+        anno = anno_store.get(ROOT, rel)
+        cached = (anno or {}).get("ai_summary")
+        if cached:
+            return {"summary": cached, "cached": True}
 
     full = ""
-    async for d in run():
+    async for d in ai_tasks.summarize_document(provider, src.name, text):
         full += d
+    if full.strip():
+        anno_store.patch(ROOT, rel, {"ai_summary": full.strip()})
     return {"summary": full, "cached": False}
 
 
