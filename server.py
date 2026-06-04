@@ -1367,8 +1367,7 @@ def _resolve_initial_root(cli_root: Optional[str]) -> Optional[Path]:
         print(f"[browse] warn: --root '{p}' not found, falling back")
 
     # saved state
-    state = _load_state()
-    saved = state.get("last_root")
+    saved = state_store.get_last_root()
     if saved:
         p = Path(saved)
         if p.exists() and p.is_dir():

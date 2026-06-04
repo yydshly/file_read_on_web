@@ -21,6 +21,10 @@ MAX_BYTES = 500 * 1024 * 1024   # 500 MB
 class TtsCache:
     """Thread-safe TTS audio cache with LRU eviction and age-based cleanup."""
 
+    TEXT_LIMIT_CHARS = 5000
+    MAX_AGE_DAYS = 60
+    MAX_BYTES = 500 * 1024 * 1024   # 500 MB
+
     def __init__(self, cache_dir: Path, logger_name: str = "ai"):
         self._cache_dir = cache_dir
         self._log = get_logger(logger_name)
