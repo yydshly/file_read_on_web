@@ -27,6 +27,7 @@ from src.backend.services import search as search_mod
 from src.backend.domain.app_metadata import APP_ID, APP_NAME, APP_VERSION, RELEASE_BASELINE
 from src.backend.routes.runtime_routes import create_runtime_router
 from src.backend.routes.cache_routes import create_cache_router
+from src.backend.routes.annotation_routes import create_annotation_router
 from src.backend.infra.logging_setup import init_logging, get_logger
 from src.backend.infra.safeio import read_json
 from src.backend.services.runtime_state import RuntimeStateStore
@@ -206,6 +207,16 @@ def _safe_resolve(rel: str) -> Path:
     if not candidate.exists():
         raise HTTPException(404, f"not found: {rel}")
     return candidate
+
+
+app.include_router(
+    create_annotation_router(
+        ctx,
+        has_root=_has_root,
+        require_root=_require_root,
+        safe_resolve=_safe_resolve,
+    )
+)
 
 
 # ---------- tree ----------
@@ -664,6 +675,15 @@ def api_search_rebuild():
     return {"ok": True}
 
 
+async def _ai_anno_patch_async(root: Path, rel_path: str, partial: dict) -> dict:
+    """Offload annotation JSON write from async handlers to avoid blocking the event loop."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None,
+        lambda: ctx.anno_store.patch(root, rel_path, partial),
+    )
+
+
 # ---------- AI ----------
 
 class AiChatBody(BaseModel):
@@ -756,7 +776,7 @@ async def api_ai_summarize(body: AiSummarizeBody):
         full = "".join(chunks).strip()
         if full:
             yield {"stage": "保存生成结果"}
-            await _anno_patch_async(root, rel, {"ai_summary": full})
+            await _ai_anno_patch_async(root, rel, {"ai_summary": full})
 
     if body.stream:
         return _sse_stream(run_stream())
@@ -775,7 +795,7 @@ async def api_ai_summarize(body: AiSummarizeBody):
     async for d in ai_tasks.summarize_document(provider, src.name, text):
         full += d
     if full.strip():
-        await _anno_patch_async(root, rel, {"ai_summary": full.strip()})
+        await _ai_anno_patch_async(root, rel, {"ai_summary": full.strip()})
     return {"summary": full, "cached": False}
 
 
@@ -872,50 +892,6 @@ def api_ai_tts_clear():
 
 
 # ---------- annotations ----------
-
-
-async def _anno_patch_async(root: Path, rel_path: str, partial: dict) -> dict:
-    """Offload annotation JSON write from async handlers to avoid blocking the event loop."""
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        None,
-        lambda: ctx.anno_store.patch(root, rel_path, partial),
-    )
-
-
-@app.get("/api/anno/all")
-def api_anno_all():
-    """All annotations + tag palette for the current root."""
-    if not _has_root():
-        return {"files": {}, "tag_palette": [], "needs_root": True}
-    return ctx.anno_store.all_for_root(_require_root())
-
-
-@app.get("/api/anno")
-def api_anno_get(path: str = Query(...)):
-    _safe_resolve(path)  # validate
-    return ctx.anno_store.get(_require_root(), path)
-
-
-@app.patch("/api/anno")
-async def api_anno_patch(request: Request, path: str = Query(...)):
-    _safe_resolve(path)  # validate
-    try:
-        body = await request.json()
-    except Exception:
-        raise HTTPException(400, "invalid JSON body")
-    if not isinstance(body, dict):
-        raise HTTPException(400, "body must be a JSON object")
-    return await _anno_patch_async(_require_root(), path, body)
-
-
-class TagPaletteBody(BaseModel):
-    tags: list[str]
-
-
-@app.put("/api/anno/palette")
-def api_anno_palette(body: TagPaletteBody):
-    return {"palette": ctx.anno_store.set_palette(_require_root(), body.tags)}
 
 
 @app.get("/api/root")
