@@ -16,6 +16,10 @@ build/
 dist/
 *.spec
 
+# Curated packaging specs are tracked (root-level generated specs remain ignored).
+!packaging/
+!packaging/*.spec
+
 # env / secrets
 .env
 .env.*
