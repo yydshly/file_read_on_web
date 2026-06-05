@@ -34,6 +34,63 @@
 
 ---
 
+## 当前架构
+
+本项目采用"本地 FastAPI 服务 + 浏览器 UI + Windows 打包"结构。`server.py` 只保留入口、路径初始化、AppContext 装配、路由注册、生命周期协调；具体业务接口已拆分到 `src/backend/routes/`。
+
+```
+server.py
+  程序入口 / 路径初始化 / AppContext 装配 / 路由注册 / 生命周期协调
+
+src/backend/routes/
+  runtime_routes.py       健康检查与版本信息
+  cache_routes.py         缓存统计、清理
+  annotation_routes.py    收藏、标签、笔记
+  ai_routes.py            AI 状态、文档整理、对话、TTS
+  system_routes.py        根目录切换、打开位置、选择目录、退出
+  static_routes.py        首页、favicon、静态资源挂载
+  file_tree_routes.py     文件树、文件预览、原文件读取
+  search_routes.py        全文搜索、索引状态、重建
+  preconvert_routes.py    Office 预转换状态
+
+src/backend/services/
+  converter.py            文件类型识别、Markdown/Text 渲染、Office 转 PDF
+  search.py               全文搜索、文本抽取、索引缓存
+  annotations.py          收藏、标签、笔记数据
+  ai_document.py          AI 文档加载、可用性判断
+  runtime_state.py        最近根目录、最近文件等运行状态
+  tts_cache.py            TTS 音频缓存
+
+src/backend/infra/
+  logging_setup.py        日志初始化
+  safeio.py               安全 JSON 读写
+  tray_controller.py      Windows 系统托盘
+
+src/backend/domain/
+  app_metadata.py         APP_ID / APP_NAME / APP_VERSION / RELEASE_BASELINE
+
+src/ai/
+  AI provider、任务编排、模型调用适配
+
+src/frontend/static/
+  浏览器 UI 静态资源
+
+scripts/
+  build_windows.ps1       构建 Windows 打包目录
+  package_release_zip.ps1 生成发布 zip（含元数据读取修复）
+  _package_zip.py         zip 打包与安全校验
+
+packaging/
+  PyInstaller spec 参考配置
+
+reports/reviews/
+  变更审查、冒烟测试、发布验证记录
+```
+
+> 设计原则：`server.py` 是入口和装配层，不是业务逻辑文件。功能 API 优先放在 `src/backend/routes/`，可复用业务能力放在 `src/backend/services/`。
+
+---
+
 ## 安装依赖
 
 ```powershell
@@ -210,7 +267,7 @@ powershell -ExecutionPolicy Bypass -File scripts/package_release_zip.ps1
 **输出示例：**
 
 ```
-release_packages/资料浏览器-v0.1.0-windows-20260604.zip
+release_packages/资料浏览器-v0.1.0-windows-YYYYMMDD.zip
 ```
 
 **包含：** `资料浏览器.exe`、`_internal/`、`app_data/config.example.json`
@@ -243,6 +300,50 @@ release_packages/资料浏览器-v0.1.0-windows-20260604.zip
 | 日志文件 | `logs/app.log` | `app_data/logs/app.log` |
 | 托盘 | 默认不显示 | 默认显示 |
 | 重复启动 | 端口冲突 | 自动复用已有服务 |
+
+---
+
+## 开发说明
+
+### 后端代码边界
+
+- 新增 API 时，优先在 `src/backend/routes/` 下按职责增加或扩展 route module。
+- 需要复用的业务能力放入 `src/backend/services/`，不要直接堆回 `server.py`。
+- 基础设施能力放入 `src/backend/infra/`，例如日志、安全写入、托盘控制。
+- 应用元数据统一维护在 `src/backend/domain/app_metadata.py`。
+- `server.py` 应继续保持为入口和装配层，不再承载具体业务 route。
+
+### 运行数据边界
+
+以下文件属于用户运行数据，不应提交到 Git，也不应进入发布 zip：
+
+```
+config.json
+state.json
+annotations.json
+search_index.json
+logs/
+cache/
+app_data/ 中的真实运行数据
+```
+
+发布包中只应包含配置模板：
+
+```
+app_data/config.example.json
+```
+
+### 发布验证
+
+完整发布验证建议按以下顺序：
+
+```powershell
+python -m compileall .
+powershell -ExecutionPolicy Bypass -File scripts/build_windows.ps1
+powershell -ExecutionPolicy Bypass -File scripts/package_release_zip.ps1
+```
+
+发布 zip 应解压到仓库外目录进行测试，例如 `D:\tmp\file_read_on_web_release_test`。
 
 ---
 
@@ -303,6 +404,16 @@ A: 应将 zip 解压到仓库外的目录（如 `D:\tmp\`）进行测试，不�
 正式分发前请执行：
 
 - [Release Checklist V1](docs/94-release-checklist-v1.md)
+
+---
+
+最近一次完整验证（route/module split 后）：
+
+- dev runtime smoke：通过
+- Windows build：通过
+- release zip：通过
+- packaged runtime smoke：通过
+- zip safety：通过
 
 ---
 
