@@ -43,6 +43,29 @@ _SKIP_DIRS = {
 }
 
 
+# ------------------------------------------------------------------
+# Internal helpers — lock-protected mutation
+# ------------------------------------------------------------------
+
+def _set_skipped(abs_key: str, reason: str) -> None:
+    """Thread-safe write to _skipped."""
+    with _cache_lock:
+        _skipped[abs_key] = reason
+
+
+def _mark_scanned(abs_key: str, scanned: bool) -> None:
+    """Thread-safe write to _scanned."""
+    with _cache_lock:
+        if scanned:
+            _scanned.add(abs_key)
+        else:
+            _scanned.discard(abs_key)
+
+
+# ------------------------------------------------------------------
+# Text extraction
+# ------------------------------------------------------------------
+
 def _extract_pdf(p: Path) -> str:
     if pypdf is None:
         return ""
@@ -50,13 +73,14 @@ def _extract_pdf(p: Path) -> str:
         size = p.stat().st_size
     except OSError:
         return ""
+    abs_key = str(p.resolve())
     if size > _PDF_MAX_BYTES:
-        _skipped[str(p.resolve())] = f"too large ({size/1024/1024:.1f} MB > {_PDF_MAX_BYTES/1024/1024:.0f} MB)"
+        _set_skipped(abs_key, f"too large ({size/1024/1024:.1f} MB > {_PDF_MAX_BYTES/1024/1024:.0f} MB)")
         return ""
     try:
         reader = pypdf.PdfReader(str(p))
     except Exception as e:
-        _skipped[str(p.resolve())] = f"pypdf open failed: {e}"
+        _set_skipped(abs_key, f"pypdf open failed: {e}")
         return ""
     parts: list[str] = []
     n = min(len(reader.pages), _PDF_PAGE_CAP)
@@ -90,23 +114,50 @@ def _extract_text(p: Path, cache_dir: Path) -> str:
     return ""
 
 
+# ------------------------------------------------------------------
+# Text cache access — double-check locking
+# ------------------------------------------------------------------
+
 def _get_text(p: Path, cache_dir: Path) -> str:
     try:
         mtime = p.stat().st_mtime
     except OSError:
         return ""
     abs_key = str(p.resolve())
-    cached = _text_cache.get(abs_key)
-    if cached and cached[0] == mtime:
-        return cached[1]
+
+    # Fast path: check cache under lock
+    with _cache_lock:
+        cached = _text_cache.get(abs_key)
+        if cached and cached[0] == mtime:
+            return cached[1]
+
+    # Slow path: extract text (outside lock — can be slow for PDFs)
     text = _extract_text(p, cache_dir)
-    _text_cache[abs_key] = (mtime, text)
+
+    # If mtime changed while extracting, don't cache stale content
+    try:
+        current_mtime = p.stat().st_mtime
+    except OSError:
+        return text
+    if current_mtime != mtime:
+        return text
+
+    # Write to cache under lock, with double-check
+    with _cache_lock:
+        # Another thread may have cached it while we were extracting
+        cached = _text_cache.get(abs_key)
+        if cached and cached[0] == mtime:
+            return cached[1]
+        _text_cache[abs_key] = (mtime, text)
+
     # Track scanned PDFs: those whose pypdf yields almost no text.
-    if p.suffix.lower() == ".pdf" and abs_key not in _skipped:
-        if len(text.strip()) < _SCANNED_TEXT_THRESHOLD:
-            _scanned.add(abs_key)
-        else:
-            _scanned.discard(abs_key)
+    # Check skipped snapshot safely under lock.
+    with _cache_lock:
+        is_skipped = abs_key in _skipped
+
+    if not is_skipped and p.suffix.lower() == ".pdf":
+        _mark_scanned(abs_key, len(text.strip()) < _SCANNED_TEXT_THRESHOLD)
+
     return text
 
 
@@ -177,23 +228,30 @@ def search(root: Path, cache_dir: Path, query: str, limit: int = 50) -> list[dic
 
 
 def index_stats() -> dict:
+    with _cache_lock:
+        values = list(_text_cache.values())
+        skipped_count = len(_skipped)
+        scanned_count = len(_scanned)
     return {
-        "cached_files": len(_text_cache),
-        "cached_bytes": sum(len(t) for _, t in _text_cache.values()),
-        "skipped": len(_skipped),
-        "scanned": len(_scanned),
+        "cached_files": len(values),
+        "cached_bytes": sum(len(t) for _, t in values),
+        "skipped": skipped_count,
+        "scanned": scanned_count,
     }
 
 
 def skipped_files() -> dict:
-    return dict(_skipped)
+    with _cache_lock:
+        return dict(_skipped)
 
 
 def scanned_files(root: Path | None = None) -> list[str]:
     """Return paths detected as scanned (image-only) PDFs. If root provided,
     paths are returned root-relative; otherwise absolute."""
+    with _cache_lock:
+        scanned_snapshot = list(_scanned)
     out = []
-    for abs_p in _scanned:
+    for abs_p in scanned_snapshot:
         if root is None:
             out.append(abs_p)
         else:
@@ -211,7 +269,8 @@ def get_indexed_text(p: Path, cache_dir: Path) -> str:
 
 
 def is_scanned(p: Path) -> bool:
-    return str(p.resolve()) in _scanned
+    with _cache_lock:
+        return str(p.resolve()) in _scanned
 
 
 def clear_cache() -> None:
@@ -315,16 +374,24 @@ def save_index(index_path: Path) -> bool:
     """Persist the text cache to disk. Best-effort; returns success bool."""
     from src.backend.infra.safeio import atomic_write_json
     try:
+        # Snapshot dictionaries under lock — iteration outside the lock
         with _cache_lock:
-            payload = {
-                "version": 1,
-                "files": {
-                    k: {"mtime": v[0], "text": _clean_utf8_text(v[1])}
-                    for k, v in _text_cache.items()
-                },
-                "skipped": {k: _clean_utf8_text(v) for k, v in _skipped.items()},
-                "saved_at": time.time(),
-            }
+            text_cache_snapshot = dict(_text_cache)
+            skipped_snapshot = dict(_skipped)
+
+        payload = {
+            "version": 1,
+            "files": {
+                k: {"mtime": v[0], "text": _clean_utf8_text(v[1])}
+                for k, v in text_cache_snapshot.items()
+            },
+            "skipped": {
+                k: _clean_utf8_text(v)
+                for k, v in skipped_snapshot.items()
+            },
+            "saved_at": time.time(),
+        }
+
         atomic_write_json(index_path, payload)
         return True
     except Exception as e:
