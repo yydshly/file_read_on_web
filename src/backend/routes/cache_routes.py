@@ -14,8 +14,27 @@ def _dir_stats(d: Path, glob: str = "*") -> dict:
     """Return file count and total bytes for files in directory matching glob."""
     if not d.exists():
         return {"files": 0, "bytes": 0}
-    files = [f for f in d.glob(glob) if f.is_file()]
-    return {"files": len(files), "bytes": sum(f.stat().st_size for f in files)}
+    count = 0
+    total = 0
+    for f in d.glob(glob):
+        try:
+            if not f.is_file():
+                continue
+            total += f.stat().st_size
+            count += 1
+        except OSError:
+            continue
+    return {"files": count, "bytes": total}
+
+
+def _file_stats(p: Path) -> dict:
+    """Return file count and bytes for a single file, tolerating disappearing files."""
+    try:
+        if p.exists() and p.is_file():
+            return {"files": 1, "bytes": p.stat().st_size}
+    except OSError:
+        pass
+    return {"files": 0, "bytes": 0}
 
 
 def create_cache_router(
@@ -48,10 +67,7 @@ def create_cache_router(
         """Unified view of every on-disk cache the app maintains."""
         pdf = converter_mod.cache_stats(cache_dir)
         tts = ctx.tts_cache.stats()
-        idx = {
-            "files": search_index_path.exists() and 1 or 0,
-            "bytes": search_index_path.stat().st_size if search_index_path.exists() else 0,
-        }
+        idx = _file_stats(search_index_path)
         logs = _dir_stats(data_dir / "logs")
         return {
             "office_pdf": {

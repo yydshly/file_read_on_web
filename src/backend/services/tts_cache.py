@@ -136,11 +136,17 @@ class TtsCache:
         """Return ``{"files": int, "bytes": int}`` for all *.audio files."""
         if not self._cache_dir.exists():
             return {"files": 0, "bytes": 0}
-        files = [f for f in self._cache_dir.glob("*.audio") if f.is_file()]
-        return {
-            "files": len(files),
-            "bytes": sum(f.stat().st_size for f in files),
-        }
+        count = 0
+        total = 0
+        for f in self._cache_dir.glob("*.audio"):
+            try:
+                if not f.is_file():
+                    continue
+                total += f.stat().st_size
+                count += 1
+            except OSError:
+                continue
+        return {"files": count, "bytes": total}
 
     # ------------------------------------------------------------------
     # Private helpers

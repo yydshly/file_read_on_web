@@ -26,6 +26,7 @@
         "group_id": "${MINIMAX_GROUP_ID}",
         "base_url": "https://api.minimaxi.com/v1",
         "default_voice": "female-shaonv",
+        "enable_vision": false,
         "models": {
           "text": "MiniMax-Text-01",
           "tts":  "speech-01-turbo",

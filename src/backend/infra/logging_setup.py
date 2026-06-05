@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import logging.handlers
 import sys
+from logging import NullHandler, StreamHandler
 from pathlib import Path
 
 _initialized = False
@@ -21,42 +22,57 @@ def init_logging(data_dir: Path, level: int = logging.INFO) -> Path:
         return data_dir / "logs"
 
     log_dir = data_dir / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
-    log_file = log_dir / "app.log"
+    handlers = []
+    fallback_error = None
+
+    try:
+        log_dir.mkdir(parents=True, exist_ok=True)
+        log_file = log_dir / "app.log"
+
+        fmt = logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
+
+        file_handler = logging.handlers.RotatingFileHandler(
+            str(log_file), maxBytes=2 * 1024 * 1024, backupCount=5,
+            encoding="utf-8",
+        )
+        file_handler.setFormatter(fmt)
+        file_handler.setLevel(level)
+        handlers.append(file_handler)
+    except OSError as e:
+        fallback_error = e
+
+    # Fallback handlers if file logging failed
+    if sys.stderr is not None:
+        handlers.append(StreamHandler())
+    elif not handlers:
+        handlers.append(NullHandler())
 
     root = logging.getLogger()
     root.setLevel(level)
-
-    # Avoid duplicate handlers if something already configured logging
     root.handlers.clear()
 
-    fmt = logging.Formatter(
-        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
+        handlers=handlers,
+        force=True,
     )
-
-    file_handler = logging.handlers.RotatingFileHandler(
-        str(log_file), maxBytes=2 * 1024 * 1024, backupCount=5,
-        encoding="utf-8",
-    )
-    file_handler.setFormatter(fmt)
-    file_handler.setLevel(level)
-    root.addHandler(file_handler)
-
-    # Only add a console handler when stdout is available and functional.
-    # In --noconsole / PyInstaller frozen mode sys.stdout may be None,
-    # and even when set the TTY check (isatty) can fail.
-    stream = getattr(sys, "stdout", None)
-    if stream is not None and hasattr(stream, "write"):
-        console = logging.StreamHandler(stream)
-        console.setFormatter(fmt)
-        console.setLevel(level)
-        root.addHandler(console)
 
     # Silence the most chatty libraries
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
     _initialized = True
+
+    if fallback_error is not None:
+        try:
+            logging.getLogger("browse").warning("file logging unavailable: %s", fallback_error)
+        except Exception:
+            pass
+
     return log_dir
 
 

@@ -10,9 +10,37 @@ import json
 import os
 import shutil
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any
+
+
+_REPLACE_RETRY_DELAYS = (0.02, 0.05, 0.1, 0.2, 0.4)
+_TRANSIENT_REPLACE_WINERRORS = {5, 32, 33}
+
+
+def _is_transient_replace_error(e: OSError) -> bool:
+    if isinstance(e, PermissionError):
+        return True
+    return getattr(e, "winerror", None) in _TRANSIENT_REPLACE_WINERRORS
+
+
+def _replace_with_retry(src: Path, dst: Path) -> None:
+    last_error: OSError | None = None
+    for delay in (*_REPLACE_RETRY_DELAYS, None):
+        try:
+            os.replace(src, dst)
+            return
+        except OSError as e:
+            if not _is_transient_replace_error(e):
+                raise
+            last_error = e
+            if delay is None:
+                raise
+            time.sleep(delay)
+    if last_error:
+        raise last_error
 
 
 def atomic_write_json(path: Path, data: Any, *, keep_backup: bool = True) -> None:
@@ -44,7 +72,7 @@ def atomic_write_json(path: Path, data: Any, *, keep_backup: bool = True) -> Non
                 os.fsync(f.fileno())
             except OSError:
                 pass
-        os.replace(tmp, path)
+        _replace_with_retry(tmp, path)
     finally:
         try:
             if tmp.exists():
