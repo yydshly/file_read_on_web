@@ -18,7 +18,6 @@ from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
-from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from src.backend.services import annotations as annotations_mod
@@ -30,6 +29,7 @@ from src.backend.routes.cache_routes import create_cache_router
 from src.backend.routes.annotation_routes import create_annotation_router
 from src.backend.routes.ai_routes import create_ai_router
 from src.backend.routes.system_routes import create_system_router
+from src.backend.routes.static_routes import register_static_routes
 from src.backend.infra.logging_setup import init_logging, get_logger
 from src.backend.infra.safeio import read_json
 from src.backend.services.runtime_state import RuntimeStateStore
@@ -680,21 +680,7 @@ def api_search_rebuild():
 # ---------- annotations ----------
 
 
-@app.get("/")
-def index():
-    return FileResponse(STATIC_DIR / "index.html")
-
-
-@app.get("/favicon.ico")
-def favicon():
-    """Serve favicon from static directory."""
-    favicon_path = STATIC_DIR / "favicon.ico"
-    if favicon_path.exists():
-        return FileResponse(favicon_path)
-    raise HTTPException(404, "favicon not found")
-
-
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+register_static_routes(app, STATIC_DIR)
 
 
 # ---------- startup ----------
