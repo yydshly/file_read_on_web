@@ -1,7 +1,7 @@
 """Minimax provider — text chat (streaming SSE) + TTS.
 
-Vision (MiniMax-VL-01) is a TODO: the chat endpoint already supports
-multimodal messages, so once we wire it the same client handles it.
+Vision (MiniMax-VL-01) is wired but disabled by default; set
+enable_vision=true in config to activate.
 
 Docs (current as of 2026-06):
 - Chat:  POST {base_url}/text/chatcompletion_v2  (SSE streaming via `stream=true`)
@@ -13,7 +13,8 @@ Required config fields:
 - base_url     (default: https://api.minimaxi.com/v1)
 - models.text  (default: MiniMax-Text-01)
 - models.tts   (default: speech-01-turbo)
-- models.vision (default: MiniMax-VL-01)
+- enable_vision (default: false; current product does not wire Vision/OCR flow)
+- models.vision  (optional; defaults to MiniMax-VL-01 only when enable_vision=true)
 """
 from __future__ import annotations
 
@@ -55,13 +56,15 @@ class MinimaxProvider(LLMProvider):
         models = self.config.get("models") or {}
         self.text_model = models.get("text", DEFAULT_TEXT_MODEL)
         self.tts_model = models.get("tts", DEFAULT_TTS_MODEL)
-        self.vision_model = models.get("vision", DEFAULT_VISION_MODEL)
+        self.enable_vision = bool(self.config.get("enable_vision", False))
+        self.vision_model = models.get("vision") or (
+            DEFAULT_VISION_MODEL if self.enable_vision else None
+        )
         self.default_voice = self.config.get("default_voice", DEFAULT_VOICE)
 
         self.name = self.config.get("name") or "minimax"
         self.capabilities = {Capability.TEXT, Capability.TTS}
-        # MiniMax-VL-01 supports vision; enable if vision model configured.
-        if self.vision_model:
+        if self.enable_vision and self.vision_model:
             self.capabilities.add(Capability.VISION)
 
     # ---- helpers ----

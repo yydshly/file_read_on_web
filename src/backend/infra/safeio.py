@@ -9,6 +9,8 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import threading
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -31,15 +33,24 @@ def atomic_write_json(path: Path, data: Any, *, keep_backup: bool = True) -> Non
             # backup failure shouldn't block the primary write
             pass
 
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-        f.flush()
+    tmp = path.with_name(
+        f"{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except OSError:
+                pass
+        os.replace(tmp, path)
+    finally:
         try:
-            os.fsync(f.fileno())
+            if tmp.exists():
+                tmp.unlink()
         except OSError:
             pass
-    os.replace(tmp, path)
 
 
 def read_json(path: Path, default: Any = None, *, try_backup: bool = True) -> Any:

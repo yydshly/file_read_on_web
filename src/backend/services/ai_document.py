@@ -105,8 +105,8 @@ class AiDocumentService:
             if info["char_count"] > self._soft_limit:
                 info["mode"] = "summarize_first"
                 info["reasons"].append(
-                    f"文档较长（{info['char_count']:,} 字符），将先生成结构化摘要，"
-                    "后续问答基于摘要 + 检索片段"
+                    f"文档较长（{info['char_count']:,} 字符），建议先生成结构化摘要后再进行问答。"
+                    "当前版本不会自动执行跨段检索增强。"
                 )
         return info
 
