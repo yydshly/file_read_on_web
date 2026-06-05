@@ -15,7 +15,7 @@ import webbrowser
 from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
 from src.backend.services import annotations as annotations_mod
@@ -29,6 +29,7 @@ from src.backend.routes.ai_routes import create_ai_router
 from src.backend.routes.system_routes import create_system_router
 from src.backend.routes.static_routes import register_static_routes
 from src.backend.routes.file_tree_routes import FileTreeRouteState, create_file_tree_router
+from src.backend.routes.search_routes import SearchRouteState, create_search_router
 from src.backend.infra.logging_setup import init_logging, get_logger
 from src.backend.infra.safeio import read_json
 from src.backend.services.runtime_state import RuntimeStateStore
@@ -231,6 +232,24 @@ app.include_router(
 )
 
 
+# Search route state and router — includes search index prebuild state
+search_route_state = SearchRouteState(
+    ctx,
+    search_mod=search_mod,
+    cache_dir=CACHE_DIR,
+    search_index_path=SEARCH_INDEX_PATH,
+)
+
+app.include_router(
+    create_search_router(
+        ctx,
+        search_route_state,
+        has_root=_has_root,
+        require_root=_require_root,
+    )
+)
+
+
 app.include_router(
     create_annotation_router(
         ctx,
@@ -331,74 +350,19 @@ def _start_preconvert():
     _preconvert_task = asyncio.create_task(_preconvert_worker(_require_root()))
 
 
-# Background search-index prebuild
-_prebuild_task: Optional[asyncio.Task] = None
-_prebuild_root: Optional[Path] = None
-_search_index_loaded_root: Optional[Path] = None
-
-
-async def _prebuild_worker(root: Path):
-    global _prebuild_root
-    _prebuild_root = root
-    loop = asyncio.get_running_loop()
-    print(f"[search] 开始建索引 (root={root.name})")
-
-    def _should_continue():
-        return _prebuild_root == root
-
-    def _checkpoint():
-        search_mod.save_index(SEARCH_INDEX_PATH)
-
-    try:
-        await loop.run_in_executor(
-            None, search_mod.prebuild, root, CACHE_DIR,
-            _should_continue, _checkpoint
-        )
-    except asyncio.CancelledError:
-        print("[search] 索引任务已取消（已保存当前进度）")
-        try:
-            search_mod.save_index(SEARCH_INDEX_PATH)
-        except Exception:
-            pass
-        raise
-    if _should_continue():
-        await loop.run_in_executor(None, search_mod.save_index, SEARCH_INDEX_PATH)
-        s = search_mod.index_stats()
-        print(f"[search] 索引完成: {s['cached_files']} 个文件, "
-              f"{s['cached_bytes']/1024:.0f} KB, 跳过 {s['skipped']} 个")
-
-
-def _start_prebuild():
-    global _prebuild_task
-    if not _has_root():
-        return
-    if _prebuild_task and not _prebuild_task.done():
-        _prebuild_task.cancel()
-    _prebuild_task = asyncio.create_task(_prebuild_worker(_require_root()))
-
-
 def _stop_background_tasks():
-    global _prebuild_root, _search_index_loaded_root
-    _prebuild_root = None
-    _search_index_loaded_root = None
-    if _preconvert_task and not _preconvert_task.done():
-        _preconvert_task.cancel()
-    if _prebuild_task and not _prebuild_task.done():
-        _prebuild_task.cancel()
+    # search prebuild state is owned by search_route_state; delegate
+    search_route_state.reset_for_root_change_or_shutdown()
+    search_route_state.cancel_prebuild_task()
+
     # warm task state is owned by file_tree_state; delegate
     file_tree_state.reset_background_root()
     file_tree_state.cancel_warm_task()
 
+    if _preconvert_task and not _preconvert_task.done():
+        _preconvert_task.cancel()
 
-def _ensure_search_index_loaded() -> int:
-    global _search_index_loaded_root
-    if not _has_root():
-        return 0
-    if _search_index_loaded_root == ctx.root:
-        return 0
-    loaded = search_mod.load_index(SEARCH_INDEX_PATH)
-    _search_index_loaded_root = ctx.root
-    return loaded
+
 
 
 @app.on_event("startup")
@@ -429,71 +393,6 @@ def api_preconvert_status():
     else:
         s["progress"] = 0.0
     return s
-
-
-_SEARCH_INDEX_SAVE_MIN_INTERVAL = 10.0
-_last_search_index_save_at = 0.0
-_search_index_save_lock = threading.Lock()
-
-
-def _maybe_save_search_index() -> bool:
-    global _last_search_index_save_at
-    now = time.time()
-    with _search_index_save_lock:
-        if now - _last_search_index_save_at < _SEARCH_INDEX_SAVE_MIN_INTERVAL:
-            return False
-        _last_search_index_save_at = now
-    return search_mod.save_index(SEARCH_INDEX_PATH)
-
-
-@app.get("/api/search")
-async def api_search(q: str = Query(...), limit: int = 50):
-    """Full-text substring search. CPU-bound — runs in default executor."""
-    root = _require_root()
-    loop = asyncio.get_running_loop()
-    loaded = await loop.run_in_executor(None, _ensure_search_index_loaded)
-    results = await loop.run_in_executor(
-        None, search_mod.search, root, CACHE_DIR, q, limit
-    )
-    saved = await loop.run_in_executor(None, _maybe_save_search_index)
-    return {"query": q, "count": len(results), "results": results,
-            "index": search_mod.index_stats(),
-            "prebuild": search_mod.prebuild_status(),
-            "loaded": loaded, "index_saved": saved}
-
-
-@app.get("/api/search/status")
-def api_search_status():
-    if not _has_root():
-        s = search_mod.prebuild_status()
-        s["needs_root"] = True
-        return s
-    return search_mod.prebuild_status()
-
-
-@app.get("/api/search/skipped")
-def api_search_skipped():
-    if not _has_root():
-        return {"skipped": {}, "needs_root": True}
-    return {"skipped": search_mod.skipped_files()}
-
-
-@app.get("/api/search/scanned")
-def api_search_scanned():
-    """List PDFs we detected as scanned (image-only). These can't be searched
-    or fed to the AI text pipeline without OCR."""
-    if not _has_root():
-        return {"scanned": [], "needs_root": True}
-    return {"scanned": search_mod.scanned_files(_require_root())}
-
-
-@app.post("/api/search/rebuild")
-def api_search_rebuild():
-    if not _has_root():
-        return {"ok": False, "needs_root": True, "detail": "请先选择资料目录"}
-    search_mod.clear_cache()
-    _start_prebuild()
-    return {"ok": True}
 
 
 # ---------- annotations ----------
