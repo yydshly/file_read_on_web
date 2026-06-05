@@ -30,6 +30,7 @@ from src.backend.routes.system_routes import create_system_router
 from src.backend.routes.static_routes import register_static_routes
 from src.backend.routes.file_tree_routes import FileTreeRouteState, create_file_tree_router
 from src.backend.routes.search_routes import SearchRouteState, create_search_router
+from src.backend.routes.preconvert_routes import PreconvertRouteState, create_preconvert_router
 from src.backend.infra.logging_setup import init_logging, get_logger
 from src.backend.infra.safeio import read_json
 from src.backend.services.runtime_state import RuntimeStateStore
@@ -141,12 +142,6 @@ app = FastAPI()
 
 # AI providers set during main() via ctx.ai_text_provider and ctx.ai_tts_provider
 
-# Background preconvert state
-_preconvert_task: Optional[asyncio.Task] = None
-_preconvert_status: dict = {"running": False, "total": 0, "done": 0,
-                             "current": None, "errors": 0, "started_at": None,
-                             "finished_at": None}
-
 
 # ---------- config persistence ----------
 
@@ -250,6 +245,20 @@ app.include_router(
 )
 
 
+# Preconvert route state and router
+preconvert_route_state = PreconvertRouteState(
+    ctx,
+    converter_mod=converter,
+    cache_dir=CACHE_DIR,
+    data_dir=DATA_DIR,
+    static_dir=STATIC_DIR,
+)
+
+app.include_router(
+    create_preconvert_router(ctx, preconvert_route_state)
+)
+
+
 app.include_router(
     create_annotation_router(
         ctx,
@@ -268,88 +277,6 @@ app.include_router(
 )
 
 
-# ---------- preconvert (background) ----------
-
-_SKIP_NAMES = {
-    "__pycache__", "node_modules", ".git", ".idea", ".vscode",
-    "build", "dist", "app_data", "_internal", "libreoffice", "LibreOffice",
-}
-
-def _scan_office_files(root: Path) -> list[Path]:
-    """Recursively find all office files under root, skipping caches/hidden."""
-    out: list[Path] = []
-    skip_roots = {DATA_DIR.resolve(), CACHE_DIR.resolve(), STATIC_DIR.resolve()}
-    for dirpath, dirnames, filenames in os.walk(root):
-        # in-place prune
-        dirnames[:] = [
-            d for d in dirnames
-            if not d.startswith(".") and d not in _SKIP_NAMES
-        ]
-        # Avoid walking our own cache/static if root is project dir
-        if Path(dirpath).resolve() in skip_roots:
-            dirnames[:] = []
-            continue
-        for name in filenames:
-            if name.startswith("."):
-                continue
-            p = Path(dirpath) / name
-            if converter.classify(p) == "office":
-                out.append(p)
-    return out
-
-
-async def _preconvert_worker(root: Path):
-    """Pre-convert all office files under root, newest first."""
-    global _preconvert_status
-    try:
-        if not converter.find_soffice():
-            print("[preconvert] LibreOffice 未安装，跳过预转换")
-            return
-
-        loop = asyncio.get_running_loop()
-        files = await loop.run_in_executor(None, _scan_office_files, root)
-        files.sort(key=lambda p: -p.stat().st_mtime)
-
-        _preconvert_status.update(
-            running=True, total=len(files), done=0, errors=0,
-            current=None, started_at=time.time(), finished_at=None,
-        )
-        print(f"[preconvert] 开始预转换 {len(files)} 个 office 文件")
-
-        for p in files:
-            if root != ctx.root:  # root switched mid-run
-                print("[preconvert] 根目录变更，中止当前任务")
-                break
-            _preconvert_status["current"] = p.name
-            try:
-                await converter.office_to_pdf(p, CACHE_DIR)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                _preconvert_status["errors"] += 1
-                print(f"[preconvert] 跳过 {p.name}: {e}")
-            _preconvert_status["done"] += 1
-            await asyncio.sleep(0)  # cooperative yield
-        print(f"[preconvert] 完成: 共 {len(files)} 个，错误 {_preconvert_status['errors']}")
-    except asyncio.CancelledError:
-        print("[preconvert] 已取消")
-        raise
-    finally:
-        _preconvert_status["running"] = False
-        _preconvert_status["current"] = None
-        _preconvert_status["finished_at"] = time.time()
-
-
-def _start_preconvert():
-    """(Re)start the background preconvert task for current ROOT."""
-    global _preconvert_task
-    if not ctx.preconvert_enabled or not _has_root():
-        return
-    if _preconvert_task and not _preconvert_task.done():
-        _preconvert_task.cancel()
-    _preconvert_task = asyncio.create_task(_preconvert_worker(_require_root()))
-
-
 def _stop_background_tasks():
     # search prebuild state is owned by search_route_state; delegate
     search_route_state.reset_for_root_change_or_shutdown()
@@ -359,9 +286,7 @@ def _stop_background_tasks():
     file_tree_state.reset_background_root()
     file_tree_state.cancel_warm_task()
 
-    if _preconvert_task and not _preconvert_task.done():
-        _preconvert_task.cancel()
-
+    preconvert_route_state.cancel_preconvert_task()
 
 
 
@@ -381,18 +306,6 @@ async def _on_shutdown():
         ctx.state_store.flush(force=True)
     except Exception:
         pass
-
-
-# ---------- routes ----------
-
-@app.get("/api/preconvert/status")
-def api_preconvert_status():
-    s = dict(_preconvert_status)
-    if s["total"]:
-        s["progress"] = round(s["done"] / s["total"], 3)
-    else:
-        s["progress"] = 0.0
-    return s
 
 
 # ---------- annotations ----------
