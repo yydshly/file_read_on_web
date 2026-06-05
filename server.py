@@ -2,21 +2,16 @@
 from __future__ import annotations
 
 import argparse
-import asyncio
-import json
-import logging
 import os
 import socket
-import subprocess
 import sys
 import threading
 import time
 import webbrowser
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
 
 from src.backend.services import annotations as annotations_mod
 from src.backend.services import converter
@@ -44,10 +39,8 @@ except Exception:
     _TRAY_AVAILABLE = False
     TrayController = None  # type: ignore[assignment]
 
-from src.ai import tasks as ai_tasks
 from src.ai import factory as ai_factory
-from src.ai.base import Message as AIMessage, CapabilityNotSupported
-from src.backend.services.ai_document import AiDocumentService, build_ai_status
+from src.backend.services.ai_document import AiDocumentService
 
 def _ensure_stdio_for_noconsole() -> None:
     """PyInstaller --noconsole may set stdout/stderr to None.
