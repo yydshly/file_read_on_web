@@ -5,7 +5,6 @@ import argparse
 import asyncio
 import json
 import logging
-import mimetypes
 import os
 import socket
 import subprocess
@@ -17,7 +16,6 @@ from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from src.backend.services import annotations as annotations_mod
@@ -30,6 +28,7 @@ from src.backend.routes.annotation_routes import create_annotation_router
 from src.backend.routes.ai_routes import create_ai_router
 from src.backend.routes.system_routes import create_system_router
 from src.backend.routes.static_routes import register_static_routes
+from src.backend.routes.file_tree_routes import FileTreeRouteState, create_file_tree_router
 from src.backend.infra.logging_setup import init_logging, get_logger
 from src.backend.infra.safeio import read_json
 from src.backend.services.runtime_state import RuntimeStateStore
@@ -211,6 +210,27 @@ def _safe_resolve(rel: str) -> Path:
     return candidate
 
 
+# File/tree route state and router — includes warm-office background task
+file_tree_state = FileTreeRouteState(
+    ctx,
+    converter_mod=converter,
+    cache_dir=CACHE_DIR,
+    data_dir=DATA_DIR,
+    static_dir=STATIC_DIR,
+    app_dir=APP_DIR,
+)
+
+app.include_router(
+    create_file_tree_router(
+        ctx,
+        file_tree_state,
+        has_root=_has_root,
+        require_root=_require_root,
+        safe_resolve=_safe_resolve,
+    )
+)
+
+
 app.include_router(
     create_annotation_router(
         ctx,
@@ -229,78 +249,12 @@ app.include_router(
 )
 
 
-# ---------- tree ----------
+# ---------- preconvert (background) ----------
 
 _SKIP_NAMES = {
     "__pycache__", "node_modules", ".git", ".idea", ".vscode",
     "build", "dist", "app_data", "_internal", "libreoffice", "LibreOffice",
 }
-
-
-def _skip_tree_entry(entry: Path) -> bool:
-    name = entry.name
-    if name.startswith(".") or name in _SKIP_NAMES:
-        return True
-    try:
-        resolved = entry.resolve()
-    except OSError:
-        return True
-    skip_roots = {
-        DATA_DIR.resolve(),
-        CACHE_DIR.resolve(),
-        STATIC_DIR.resolve(),
-        (APP_DIR / "app_data").resolve(),
-        (APP_DIR / "_internal").resolve(),
-        (APP_DIR / "libreoffice").resolve(),
-        (APP_DIR / "LibreOffice").resolve(),
-    }
-    return resolved in skip_roots
-
-
-def _build_tree(d: Path, recursive: bool = True) -> dict:
-    root = _require_root()
-    children = []
-    try:
-        entries = sorted(
-            d.iterdir(),
-            key=lambda p: (not p.is_dir(), p.name.lower()),
-        )
-    except PermissionError:
-        entries = []
-    for entry in entries:
-        if _skip_tree_entry(entry):
-            continue
-        name = entry.name
-        rel = str(entry.relative_to(root)).replace("\\", "/")
-        if entry.is_dir():
-            children.append({"name": name, "path": rel, "type": "dir",
-                             "children": _build_tree(entry, recursive)["children"] if recursive else []})
-        else:
-            children.append({"name": name, "path": rel, "type": "file",
-                             "ext": entry.suffix.lower()})
-    return {"name": d.name, "path": "", "type": "dir", "children": children}
-
-
-def _iter_files_in_tree_order(d: Path):
-    """Yield files in the same visual order as the left tree."""
-    try:
-        entries = sorted(
-            d.iterdir(),
-            key=lambda p: (not p.is_dir(), p.name.lower()),
-        )
-    except (OSError, PermissionError):
-        return
-
-    for entry in entries:
-        if _skip_tree_entry(entry):
-            continue
-        if entry.is_dir():
-            yield from _iter_files_in_tree_order(entry)
-        else:
-            yield entry
-
-
-# ---------- preconvert (background) ----------
 
 def _scan_office_files(root: Path) -> list[Path]:
     """Recursively find all office files under root, skipping caches/hidden."""
@@ -380,8 +334,6 @@ def _start_preconvert():
 # Background search-index prebuild
 _prebuild_task: Optional[asyncio.Task] = None
 _prebuild_root: Optional[Path] = None
-_background_root: Optional[Path] = None
-_warm_task: Optional[asyncio.Task] = None
 _search_index_loaded_root: Optional[Path] = None
 
 
@@ -426,82 +378,16 @@ def _start_prebuild():
 
 
 def _stop_background_tasks():
-    global _prebuild_root, _background_root, _search_index_loaded_root
+    global _prebuild_root, _search_index_loaded_root
     _prebuild_root = None
-    _background_root = None
     _search_index_loaded_root = None
     if _preconvert_task and not _preconvert_task.done():
         _preconvert_task.cancel()
     if _prebuild_task and not _prebuild_task.done():
         _prebuild_task.cancel()
-    if _warm_task and not _warm_task.done():
-        _warm_task.cancel()
-
-
-def _warm_office_candidates(root: Path, limit: int = 2) -> list[Path]:
-    """Return the next ``limit`` *office* files immediately after the user's
-    last-opened file. The anchor file can be ANY type (PDF, MD, office…),
-    so we scan all files in sorted order and look for office files coming
-    after the anchor's position.
-    """
-    all_files = list(_iter_files_in_tree_order(root))
-
-    last = ctx.state_store.get_last_file(root)
-    start = 0
-    if last:
-        last_path = (root / last).resolve()
-        for i, p in enumerate(all_files):
-            if p.resolve() == last_path:
-                start = i + 1
-                break
-
-    result: list[Path] = []
-    for p in all_files[start:]:
-        if p.suffix.lower() in converter.OFFICE_EXTS:
-            result.append(p)
-            if len(result) >= limit:
-                break
-    return result
-
-
-async def _warm_office_after_tree(root: Path):
-    await asyncio.sleep(1.0)
-    if ctx.root != root:
-        return
-    for p in _warm_office_candidates(root, limit=2):
-        if ctx.root != root:
-            return
-        try:
-            await converter.office_to_pdf(p, CACHE_DIR)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            print(f"[prewarm] skip {p.name}: {e}")
-
-
-def _start_warm_after_tree(root: Path):
-    """Initial warm kicked once after /api/tree is loaded for this root."""
-    global _background_root
-    if _background_root == root:
-        return
-    _background_root = root
-    _restart_warm(root)
-
-
-def _restart_warm(root: Path):
-    """Re-spawn the warm task. Used after each /api/file so the next 2
-    office files (relative to the user's *current* position) get preconverted."""
-    global _warm_task
-    if root != ctx.root:
-        return
-    if _warm_task and not _warm_task.done():
-        _warm_task.cancel()
-    _warm_task = asyncio.create_task(_warm_office_after_tree(root))
-
-
-def _cancel_warm_task():
-    if _warm_task and not _warm_task.done():
-        _warm_task.cancel()
+    # warm task state is owned by file_tree_state; delegate
+    file_tree_state.reset_background_root()
+    file_tree_state.cancel_warm_task()
 
 
 def _ensure_search_index_loaded() -> int:
@@ -535,23 +421,6 @@ async def _on_shutdown():
 
 # ---------- routes ----------
 
-@app.get("/api/tree")
-async def api_tree(path: str = "", recursive: int = 1):
-    if not _has_root():
-        if path:
-            raise HTTPException(409, "请先选择资料目录")
-        return {"name": "", "path": "", "type": "dir", "children": [], "needs_root": True}
-    root = _require_root()
-    base = root if not path else _safe_resolve(path)
-    if not base.is_dir():
-        raise HTTPException(400, "path must be a directory")
-    loop = asyncio.get_running_loop()
-    tree = await loop.run_in_executor(None, _build_tree, base, bool(recursive))
-    if not path:
-        _start_warm_after_tree(root)
-    return tree
-
-
 @app.get("/api/preconvert/status")
 def api_preconvert_status():
     s = dict(_preconvert_status)
@@ -560,56 +429,6 @@ def api_preconvert_status():
     else:
         s["progress"] = 0.0
     return s
-
-
-@app.get("/api/file")
-async def api_file(path: str = Query(...), remember: int = 1, force: int = 0):
-    root = _require_root()
-    src = _safe_resolve(path)
-    if src.is_dir():
-        raise HTTPException(400, "path is a directory")
-
-    if remember:
-        ctx.state_store.set_last_file(root, path)
-
-    kind = converter.classify(src)
-    response: Response
-    if kind == "pdf":
-        response = FileResponse(src, media_type="application/pdf")
-    elif kind == "office":
-        _cancel_warm_task()
-        try:
-            pdf = await converter.office_to_pdf(src, CACHE_DIR, force=bool(force))
-        except RuntimeError as e:
-            return JSONResponse({"error": "convert_failed", "message": str(e)}, status_code=500)
-        response = FileResponse(pdf, media_type="application/pdf")
-    elif kind == "markdown":
-        response = HTMLResponse(converter.render_markdown(src, root))
-    elif kind == "text":
-        response = HTMLResponse(converter.render_text(src))
-    elif kind == "image":
-        response = FileResponse(src, media_type=converter.image_mime(src))
-    else:
-        return JSONResponse({"error": "unsupported", "name": src.name, "ext": src.suffix},
-                            status_code=415)
-
-    # After the user has moved to a new file, restart prewarm so the next
-    # 2 office files (relative to the new position) get queued in background.
-    # last_file has already been updated above when remember=1.
-    if remember and ctx.preconvert_enabled:
-        _restart_warm(root)
-
-    return response
-
-
-@app.get("/api/raw")
-def api_raw(path: str = Query(...)):
-    src = _safe_resolve(path)
-    if src.is_dir():
-        raise HTTPException(400, "path is a directory")
-    mime, _ = mimetypes.guess_type(src.name)
-    return FileResponse(src, media_type=mime or "application/octet-stream",
-                        filename=src.name)
 
 
 _SEARCH_INDEX_SAVE_MIN_INTERVAL = 10.0
