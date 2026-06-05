@@ -29,6 +29,7 @@ from src.backend.infra.logging_setup import init_logging, get_logger
 from src.backend.infra.safeio import read_json
 from src.backend.services.runtime_state import RuntimeStateStore
 from src.backend.services.tts_cache import TtsCache
+from src.backend.app_context import AppContext, AppPaths
 
 try:
     from src.backend.infra.tray_controller import TrayController
@@ -107,15 +108,33 @@ DEFAULT_ROOT_REL = "教学资料"
 
 anno_store = annotations_mod.AnnotationStore(ANNO_PATH)
 tts_cache = TtsCache(TTS_CACHE_DIR)
+state_store = RuntimeStateStore(STATE_PATH, CONFIG_PATH)
+ai_doc_service = AiDocumentService(CACHE_DIR)
+
+# Application context — single source of truth for mutable runtime state
+ctx = AppContext(
+    paths=AppPaths(
+        app_dir=APP_DIR,
+        data_dir=DATA_DIR,
+        resource_dir=RESOURCE_DIR,
+        static_dir=STATIC_DIR,
+        cache_dir=CACHE_DIR,
+        tts_cache_dir=TTS_CACHE_DIR,
+        config_path=CONFIG_PATH,
+        state_path=STATE_PATH,
+        anno_path=ANNO_PATH,
+        search_index_path=SEARCH_INDEX_PATH,
+        default_root_rel=DEFAULT_ROOT_REL,
+    ),
+    anno_store=anno_store,
+    state_store=state_store,
+    tts_cache=tts_cache,
+    ai_doc_service=ai_doc_service,
+)
 
 app = FastAPI()
 
-ROOT: Optional[Path] = None
-PRECONVERT_ENABLED: bool = True
-
-# AI providers built from config on startup; either may be None if not configured.
-ai_text_provider = None     # type: ignore[var-annotated]
-ai_tts_provider = None      # type: ignore[var-annotated]
+# AI providers set during main() via ctx.ai_text_provider and ctx.ai_tts_provider
 
 # Background preconvert state
 _preconvert_task: Optional[asyncio.Task] = None
@@ -135,19 +154,18 @@ def _load_config() -> dict:
 
 
 # ---------- runtime state service ----------
-state_store = RuntimeStateStore(STATE_PATH, CONFIG_PATH)
 
 
 # ---------- path safety ----------
 
 def _has_root() -> bool:
-    return ROOT is not None and ROOT.exists() and ROOT.is_dir()
+    return ctx.root is not None and ctx.root.exists() and ctx.root.is_dir()
 
 
 def _require_root() -> Path:
     if not _has_root():
         raise HTTPException(409, "请先选择资料目录")
-    return ROOT
+    return ctx.root
 
 
 def _safe_resolve(rel: str) -> Path:
@@ -279,7 +297,7 @@ async def _preconvert_worker(root: Path):
         print(f"[preconvert] 开始预转换 {len(files)} 个 office 文件")
 
         for p in files:
-            if root != ROOT:  # root switched mid-run
+            if root != ctx.root:  # root switched mid-run
                 print("[preconvert] 根目录变更，中止当前任务")
                 break
             _preconvert_status["current"] = p.name
@@ -305,7 +323,7 @@ async def _preconvert_worker(root: Path):
 def _start_preconvert():
     """(Re)start the background preconvert task for current ROOT."""
     global _preconvert_task
-    if not PRECONVERT_ENABLED or not _has_root():
+    if not ctx.preconvert_enabled or not _has_root():
         return
     if _preconvert_task and not _preconvert_task.done():
         _preconvert_task.cancel()
@@ -381,7 +399,7 @@ def _warm_office_candidates(root: Path, limit: int = 2) -> list[Path]:
     """
     all_files = list(_iter_files_in_tree_order(root))
 
-    last = state_store.get_last_file(root)
+    last = ctx.state_store.get_last_file(root)
     start = 0
     if last:
         last_path = (root / last).resolve()
@@ -401,10 +419,10 @@ def _warm_office_candidates(root: Path, limit: int = 2) -> list[Path]:
 
 async def _warm_office_after_tree(root: Path):
     await asyncio.sleep(1.0)
-    if ROOT != root:
+    if ctx.root != root:
         return
     for p in _warm_office_candidates(root, limit=2):
-        if ROOT != root:
+        if ctx.root != root:
             return
         try:
             await converter.office_to_pdf(p, CACHE_DIR)
@@ -427,7 +445,7 @@ def _restart_warm(root: Path):
     """Re-spawn the warm task. Used after each /api/file so the next 2
     office files (relative to the user's *current* position) get preconverted."""
     global _warm_task
-    if root != ROOT:
+    if root != ctx.root:
         return
     if _warm_task and not _warm_task.done():
         _warm_task.cancel()
@@ -443,10 +461,10 @@ def _ensure_search_index_loaded() -> int:
     global _search_index_loaded_root
     if not _has_root():
         return 0
-    if _search_index_loaded_root == ROOT:
+    if _search_index_loaded_root == ctx.root:
         return 0
     loaded = search_mod.load_index(SEARCH_INDEX_PATH)
-    _search_index_loaded_root = ROOT
+    _search_index_loaded_root = ctx.root
     return loaded
 
 
@@ -463,7 +481,7 @@ async def _on_shutdown():
     # Final flush of debounced state (HOTFIX #4) — never lose the user's
     # last click just because we shut down before the timer fired.
     try:
-        state_store.flush(force=True)
+        ctx.state_store.flush(force=True)
     except Exception:
         pass
 
@@ -505,7 +523,7 @@ async def api_file(path: str = Query(...), remember: int = 1, force: int = 0):
         raise HTTPException(400, "path is a directory")
 
     if remember:
-        state_store.set_last_file(root, path)
+        ctx.state_store.set_last_file(root, path)
 
     kind = converter.classify(src)
     response: Response
@@ -531,7 +549,7 @@ async def api_file(path: str = Query(...), remember: int = 1, force: int = 0):
     # After the user has moved to a new file, restart prewarm so the next
     # 2 office files (relative to the new position) get queued in background.
     # last_file has already been updated above when remember=1.
-    if remember and PRECONVERT_ENABLED:
+    if remember and ctx.preconvert_enabled:
         _restart_warm(root)
 
     return response
@@ -573,7 +591,7 @@ def _dir_stats(d: Path, glob: str = "*") -> dict:
 def api_cache_stats():
     """Unified view of every on-disk cache the app maintains."""
     pdf = converter.cache_stats(CACHE_DIR)
-    tts = tts_cache.stats()
+    tts = ctx.tts_cache.stats()
     idx = {
         "files": SEARCH_INDEX_PATH.exists() and 1 or 0,
         "bytes": SEARCH_INDEX_PATH.stat().st_size if SEARCH_INDEX_PATH.exists() else 0,
@@ -601,7 +619,7 @@ def api_cache_cleanup():
     """Run cleanup on every cache (LRU + age)."""
     return {
         "office_pdf": converter.cleanup_cache(CACHE_DIR, max_age_days=30),
-        "tts_audio":  tts_cache.cleanup(),
+        "tts_audio":  ctx.tts_cache.cleanup(),
     }
 
 
@@ -661,16 +679,12 @@ def api_search_scanned():
     return {"scanned": search_mod.scanned_files(_require_root())}
 
 
-# AI document service (extracted to ai/service.py)
-ai_doc_service = AiDocumentService(CACHE_DIR)
-
-
 @app.get("/api/file/ai-eligibility")
 async def api_file_ai_eligibility(path: str = Query(...)):
     """Tell the UI whether AI features apply to this file and why not."""
     _require_root()
     src = _safe_resolve(path)
-    return await ai_doc_service.eligibility(src, path)
+    return await ctx.ai_doc_service.eligibility(src, path)
 
 
 @app.post("/api/search/rebuild")
@@ -705,22 +719,22 @@ class AiTtsBody(BaseModel):
 
 
 def _ai_require_text() -> Any:
-    if ai_text_provider is None:
+    if ctx.ai_text_provider is None:
         raise HTTPException(503, "AI 未启用：请在 config.json.ai 中配置 active provider")
-    return ai_text_provider
+    return ctx.ai_text_provider
 
 
 def _ai_require_tts() -> Any:
-    if ai_tts_provider is None:
+    if ctx.ai_tts_provider is None:
         raise HTTPException(503, "AI TTS 未启用：请配置 ai.tts_provider 或让 active provider 支持 TTS")
-    return ai_tts_provider
+    return ctx.ai_tts_provider
 
 
 @app.get("/api/ai/status")
 def api_ai_status():
     """Status + masked credential preview so users can verify the running
     process actually picked up their env vars."""
-    return build_ai_status(ai_text_provider, ai_tts_provider)
+    return build_ai_status(ctx.ai_text_provider, ctx.ai_tts_provider)
 
 
 def _sse_stream(token_iter):
@@ -752,13 +766,13 @@ async def api_ai_summarize(body: AiSummarizeBody):
     async def run_stream():
         yield {"stage": "准备文档"}
         src = _safe_resolve(body.path)
-        src, text = await ai_doc_service.load_document(src)
+        src, text = await ctx.ai_doc_service.load_document(src)
         root = _require_root()
         rel = body.path
 
         if not body.force:
             yield {"stage": "检查已生成摘要"}
-            anno = anno_store.get(root, rel)
+            anno = ctx.anno_store.get(root, rel)
             cached = (anno or {}).get("ai_summary")
             if cached:
                 yield {"stage": "使用已生成摘要", "cached": True}
@@ -780,11 +794,11 @@ async def api_ai_summarize(body: AiSummarizeBody):
         return _sse_stream(run_stream())
 
     src = _safe_resolve(body.path)
-    src, text = await ai_doc_service.load_document(src)
+    src, text = await ctx.ai_doc_service.load_document(src)
     root = _require_root()
     rel = body.path
     if not body.force:
-        anno = anno_store.get(root, rel)
+        anno = ctx.anno_store.get(root, rel)
         cached = (anno or {}).get("ai_summary")
         if cached:
             return {"summary": cached, "cached": True}
@@ -801,7 +815,7 @@ async def api_ai_summarize(body: AiSummarizeBody):
 async def api_ai_chat(body: AiChatBody):
     provider = _ai_require_text()
     src = _safe_resolve(body.path)
-    src, text = await ai_doc_service.load_document(src)
+    src, text = await ctx.ai_doc_service.load_document(src)
     history = [AIMessage(role=m["role"], content=m["content"]) for m in body.history
                if m.get("role") in {"user", "assistant"} and m.get("content")]
 
@@ -839,13 +853,13 @@ async def api_ai_tts(body: AiTtsBody):
     raw_text = body.text
     if not raw_text.strip():
         raise HTTPException(400, "text 不能为空")
-    tts_text = tts_cache.normalize_text(raw_text)
+    tts_text = ctx.tts_cache.normalize_text(raw_text)
     loop = asyncio.get_running_loop()
 
     # 1) Try local cache first — same text/voice/speed = same audio.
     hit = await loop.run_in_executor(
         None,
-        lambda: tts_cache.get(provider.name, tts_text, body.voice, body.speed),
+        lambda: ctx.tts_cache.get(provider.name, tts_text, body.voice, body.speed),
     )
     if hit is not None:
         audio, mime = hit
@@ -870,7 +884,7 @@ async def api_ai_tts(body: AiTtsBody):
     # 3) Save to disk for next time (off the event loop).
     await loop.run_in_executor(
         None,
-        lambda: tts_cache.put(provider.name, tts_text, body.voice, body.speed,
+        lambda: ctx.tts_cache.put(provider.name, tts_text, body.voice, body.speed,
                               audio, mime),
     )
 
@@ -881,12 +895,12 @@ async def api_ai_tts(body: AiTtsBody):
 @app.get("/api/ai/tts/stats")
 def api_ai_tts_stats():
     """Kept for backwards-compat; the unified /api/cache/stats is preferred."""
-    return tts_cache.stats()
+    return ctx.tts_cache.stats()
 
 
 @app.post("/api/ai/tts/clear")
 def api_ai_tts_clear():
-    return tts_cache.clear()
+    return ctx.tts_cache.clear()
 
 
 # ---------- annotations ----------
@@ -897,7 +911,7 @@ async def _anno_patch_async(root: Path, rel_path: str, partial: dict) -> dict:
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(
         None,
-        lambda: anno_store.patch(root, rel_path, partial),
+        lambda: ctx.anno_store.patch(root, rel_path, partial),
     )
 
 
@@ -906,13 +920,13 @@ def api_anno_all():
     """All annotations + tag palette for the current root."""
     if not _has_root():
         return {"files": {}, "tag_palette": [], "needs_root": True}
-    return anno_store.all_for_root(_require_root())
+    return ctx.anno_store.all_for_root(_require_root())
 
 
 @app.get("/api/anno")
 def api_anno_get(path: str = Query(...)):
     _safe_resolve(path)  # validate
-    return anno_store.get(_require_root(), path)
+    return ctx.anno_store.get(_require_root(), path)
 
 
 @app.patch("/api/anno")
@@ -933,7 +947,7 @@ class TagPaletteBody(BaseModel):
 
 @app.put("/api/anno/palette")
 def api_anno_palette(body: TagPaletteBody):
-    return {"palette": anno_store.set_palette(_require_root(), body.tags)}
+    return {"palette": ctx.anno_store.set_palette(_require_root(), body.tags)}
 
 
 @app.get("/api/health")
@@ -941,7 +955,7 @@ def api_health():
     return {"ok": True, "app_id": APP_ID, "app_name": APP_NAME,
             "version": APP_VERSION,
             "soffice": converter.find_soffice(),
-            "root": str(ROOT) if _has_root() else None,
+            "root": str(ctx.root) if _has_root() else None,
             "needs_root": not _has_root()}
 
 
@@ -964,7 +978,7 @@ def api_root_get():
     root = _require_root()
     return {
         "root": str(root),
-        "last_file": state_store.get_last_file(root),
+        "last_file": ctx.state_store.get_last_file(root),
         "needs_root": False,
     }
 
@@ -975,7 +989,6 @@ class RootBody(BaseModel):
 
 @app.post("/api/root")
 def api_root_set(body: RootBody):
-    global ROOT
     new_path = Path(body.path).expanduser()
     if not new_path.is_absolute():
         new_path = (APP_DIR / new_path).resolve()
@@ -983,15 +996,15 @@ def api_root_set(body: RootBody):
     if not new_path.exists() or not new_path.is_dir():
         raise HTTPException(400, f"not a directory: {new_path}")
     _stop_background_tasks()
-    ROOT = new_path
-    state_store.set_last_root(ROOT)
+    ctx.root = new_path
+    ctx.state_store.set_last_root(ctx.root)
     # HOTFIX-LOCAL-RESPONSIVENESS-V1 #2:
     # Do NOT clear the search text cache on root change. _text_cache is
     # keyed by absolute path, so entries for the old root cannot collide
     # with the new root. Wiping everything forced a full re-extract of
     # files the user might switch back to. The /api/search/rebuild
     # endpoint remains the explicit "wipe + rebuild" knob.
-    return {"root": str(ROOT), "last_file": state_store.get_last_file(ROOT), "needs_root": False}
+    return {"root": str(ctx.root), "last_file": ctx.state_store.get_last_file(ctx.root), "needs_root": False}
 
 
 def _bring_explorer_to_front_later(target: Path) -> None:
@@ -1093,7 +1106,7 @@ def api_pick_folder():
         root.withdraw()
         root.attributes("-topmost", True)
         try:
-            initial = str(ROOT) if _has_root() else str(APP_DIR)
+            initial = str(ctx.root) if _has_root() else str(APP_DIR)
             chosen = filedialog.askdirectory(
                 title="选择资料根目录", initialdir=initial, parent=root
             )
@@ -1188,7 +1201,7 @@ def _resolve_initial_root(cli_root: Optional[str]) -> Optional[Path]:
         print(f"[browse] warn: --root '{p}' not found, falling back")
 
     # saved state
-    saved = state_store.get_last_root()
+    saved = ctx.state_store.get_last_root()
     if saved:
         p = Path(saved)
         if p.exists() and p.is_dir():
@@ -1235,8 +1248,7 @@ def _delayed_exit(delay: float = 0.6):
     t.start()
 
 
-# Global tray controller reference — set during main()
-_tray_controller: Optional["TrayController"] = None  # type: ignore[valid-type]
+# Tray controller set during main() via ctx.tray_controller
 
 
 def _request_app_shutdown(reason: str = "api") -> None:
@@ -1256,7 +1268,7 @@ def _request_app_shutdown(reason: str = "api") -> None:
     #    down. Safe to call repeatedly — atexit handlers will no-op on the
     #    re-entry since _state_dirty becomes False after a successful write.
     try:
-        state_store.flush(force=True)
+        ctx.state_store.flush(force=True)
     except Exception:
         log.exception("state flush during shutdown failed (continuing)")
 
@@ -1265,13 +1277,12 @@ def _request_app_shutdown(reason: str = "api") -> None:
         log.info("退出时清理 %d 个残留 soffice 进程", killed)
 
     # Stop the tray icon if running
-    global _tray_controller
-    if _tray_controller is not None:
+    if ctx.tray_controller is not None:
         try:
-            _tray_controller.stop()
+            ctx.tray_controller.stop()
         except Exception:
             pass
-        _tray_controller = None
+        ctx.tray_controller = None
 
     _delayed_exit(0.6)
 
@@ -1302,7 +1313,7 @@ def main():
     log = get_logger("browse")
 
     # Migrate legacy last_root/last_files (used to live in config.json) into state.json
-    state_store.migrate_legacy_config()
+    ctx.state_store.migrate_legacy_config()
 
     # Check for existing service BEFORE initializing full state
     if not args.force_server and _is_our_service_running(args.host, args.port):
@@ -1319,18 +1330,17 @@ def main():
     tray_enabled = (getattr(sys, "frozen", False) or args.tray) and not args.no_tray
     tray_started = False
 
-    global ROOT, PRECONVERT_ENABLED
-    ROOT = _resolve_initial_root(args.root)
-    PRECONVERT_ENABLED = not args.no_preconvert
+    ctx.root = _resolve_initial_root(args.root)
+    ctx.preconvert_enabled = not args.no_preconvert
     if _has_root():
-        state_store.set_last_root(_require_root())
+        ctx.state_store.set_last_root(_require_root())
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     cleaned = converter.cleanup_cache(CACHE_DIR, max_age_days=30)
     if cleaned["removed"]:
         log.info("PDF cache: 删除 %d 项过期，保留 %d 项 (%.1f MB)",
                  cleaned["removed"], cleaned["kept"], cleaned["bytes"]/1024/1024)
-    tts_cleaned = tts_cache.cleanup()
+    tts_cleaned = ctx.tts_cache.cleanup()
     if tts_cleaned["removed"]:
         log.info("TTS cache: 删除 %d 项过期，保留 %d 项 (%.1f MB)",
                  tts_cleaned["removed"], tts_cleaned["kept"], tts_cleaned["bytes"]/1024/1024)
@@ -1344,30 +1354,27 @@ def main():
     log.info("config: %s", CONFIG_PATH)
     log.info("frozen: %s", getattr(sys, "frozen", False))
     log.info("log_dir: %s", log_dir)
-    log.info("root: %s", ROOT)
+    log.info("root: %s", ctx.root)
     log.info("LibreOffice: %s",
              soffice or "未检测到（doc/docx/xlsx 等格式将无法预览，请安装 LibreOffice）")
     log.info("host: %s  port: %s", args.host, args.port)
     log.info("open http://%s:%d/", args.host, args.port)
 
     # AI providers (best-effort: missing config just disables AI features)
-    global ai_text_provider, ai_tts_provider
     cfg = _load_config()
     ai_cfg = cfg.get("ai") or {}
     try:
-        ai_text_provider = ai_factory.make_active(ai_cfg)
+        ctx.ai_text_provider = ai_factory.make_active(ai_cfg)
     except Exception as e:
         log.warning("AI text provider 初始化失败: %s", e)
-        ai_text_provider = None
     try:
-        ai_tts_provider = ai_factory.make_tts(ai_cfg)
+        ctx.ai_tts_provider = ai_factory.make_tts(ai_cfg)
     except Exception as e:
         log.warning("AI tts provider 初始化失败: %s", e)
-        ai_tts_provider = None
     log.info("AI text: %s",
-             ai_text_provider.info() if ai_text_provider else "未配置")
+             ctx.ai_text_provider.info() if ctx.ai_text_provider else "未配置")
     log.info("AI tts:  %s",
-             ai_tts_provider.info() if ai_tts_provider else "未配置")
+             ctx.ai_tts_provider.info() if ctx.ai_tts_provider else "未配置")
 
     if not args.no_browser:
         url = f"http://{args.host}:{args.port}/"
@@ -1392,8 +1399,7 @@ def main():
         tray_started = tc.start()
         log.info("tray_started: %s", tray_started)
         if tray_started:
-            global _tray_controller
-            _tray_controller = tc
+            ctx.tray_controller = tc
     elif tray_enabled:
         log.warning("tray_enabled but dependencies unavailable (pystray/Pillow missing)")
 
@@ -1402,15 +1408,15 @@ def main():
     import atexit, signal
     def _on_exit(*_a):
         try:
-            state_store.flush(force=True)
+            ctx.state_store.flush(force=True)
         except Exception:
             pass
         killed = converter.kill_orphan_soffice()
         if killed:
             log.warning("退出时清理 %d 个残留 soffice 进程", killed)
-        if _tray_controller is not None:
+        if ctx.tray_controller is not None:
             try:
-                _tray_controller.stop()
+                ctx.tray_controller.stop()
             except Exception:
                 pass
     atexit.register(_on_exit)
