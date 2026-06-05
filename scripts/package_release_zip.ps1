@@ -3,7 +3,7 @@
     Build and package the release zip for the file browser app.
 
     1. Runs scripts/build_windows.ps1 to produce dist/资料浏览器/
-    2. Reads APP_VERSION from app_metadata.py
+    2. Reads APP_VERSION from src/backend/domain/app_metadata.py
     3. Stamps the zip with the current date (YYYYMMDD)
     4. Produces release_packages/资料浏览器-v<VERSION>-windows-<DATE>.zip
     5. Verifies the zip contents
@@ -28,8 +28,14 @@ if ($LASTEXITCODE -ne 0) {
     exit 1
 }
 
-# Step 2: Read APP_VERSION from app_metadata.py
-$AppVersion = python -c "from app_metadata import APP_VERSION; print(APP_VERSION)"
+# Step 2: Read APP_VERSION from src/backend/domain/app_metadata.py
+$MetadataPath = Join-Path $ProjectRoot "src/backend/domain/app_metadata.py"
+if (-not (Test-Path $MetadataPath)) {
+    Write-Host ("ERROR: metadata file not found: {0}" -f $MetadataPath) -ForegroundColor Red
+    exit 1
+}
+
+$AppVersion = python -c "import ast, pathlib; p = pathlib.Path(r'$MetadataPath'); tree = ast.parse(p.read_text(encoding='utf-8')); values = {n.targets[0].id: ast.literal_eval(n.value) for n in tree.body if isinstance(n, ast.Assign) and len(n.targets)==1 and isinstance(n.targets[0], ast.Name)}; print(values.get('APP_VERSION', ''))"
 if (-not $AppVersion) {
     Write-Host "ERROR: APP_VERSION was empty" -ForegroundColor Red
     exit 1
