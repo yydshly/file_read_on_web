@@ -25,6 +25,8 @@ from src.backend.services import annotations as annotations_mod
 from src.backend.services import converter
 from src.backend.services import search as search_mod
 from src.backend.domain.app_metadata import APP_ID, APP_NAME, APP_VERSION, RELEASE_BASELINE
+from src.backend.routes.runtime_routes import create_runtime_router
+from src.backend.routes.cache_routes import create_cache_router
 from src.backend.infra.logging_setup import init_logging, get_logger
 from src.backend.infra.safeio import read_json
 from src.backend.services.runtime_state import RuntimeStateStore
@@ -160,6 +162,30 @@ def _load_config() -> dict:
 
 def _has_root() -> bool:
     return ctx.root is not None and ctx.root.exists() and ctx.root.is_dir()
+
+
+# Include runtime and cache routers
+app.include_router(
+    create_runtime_router(
+        ctx,
+        app_id=APP_ID,
+        app_name=APP_NAME,
+        app_version=APP_VERSION,
+        release_baseline=RELEASE_BASELINE,
+        converter_mod=converter,
+        has_root=_has_root,
+    )
+)
+
+app.include_router(
+    create_cache_router(
+        ctx,
+        converter_mod=converter,
+        cache_dir=CACHE_DIR,
+        data_dir=DATA_DIR,
+        search_index_path=SEARCH_INDEX_PATH,
+    )
+)
 
 
 def _require_root() -> Path:
@@ -565,64 +591,6 @@ def api_raw(path: str = Query(...)):
                         filename=src.name)
 
 
-@app.post("/api/cache/clear")
-def api_cache_clear():
-    CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    removed = 0
-    skipped = 0
-    for f in CACHE_DIR.iterdir():
-        try:
-            if f.is_file():
-                f.unlink()
-                removed += 1
-        except OSError:
-            skipped += 1  # likely held by an in-flight FileResponse on Windows
-    return {"ok": True, "removed": removed, "skipped": skipped}
-
-
-def _dir_stats(d: Path, glob: str = "*") -> dict:
-    if not d.exists():
-        return {"files": 0, "bytes": 0}
-    files = [f for f in d.glob(glob) if f.is_file()]
-    return {"files": len(files), "bytes": sum(f.stat().st_size for f in files)}
-
-
-@app.get("/api/cache/stats")
-def api_cache_stats():
-    """Unified view of every on-disk cache the app maintains."""
-    pdf = converter.cache_stats(CACHE_DIR)
-    tts = ctx.tts_cache.stats()
-    idx = {
-        "files": SEARCH_INDEX_PATH.exists() and 1 or 0,
-        "bytes": SEARCH_INDEX_PATH.stat().st_size if SEARCH_INDEX_PATH.exists() else 0,
-    }
-    logs = _dir_stats(DATA_DIR / "logs")
-    return {
-        "office_pdf": {
-            **pdf,
-            "limit_bytes": 2 * 1024 * 1024 * 1024,
-            "max_age_days": 30,
-        },
-        "tts_audio": {
-            **tts,
-            "limit_bytes": TtsCache.MAX_BYTES,
-            "max_age_days": TtsCache.MAX_AGE_DAYS,
-        },
-        "search_index": idx,
-        "logs": logs,
-        "total_bytes": pdf["bytes"] + tts["bytes"] + idx["bytes"] + logs["bytes"],
-    }
-
-
-@app.post("/api/cache/cleanup")
-def api_cache_cleanup():
-    """Run cleanup on every cache (LRU + age)."""
-    return {
-        "office_pdf": converter.cleanup_cache(CACHE_DIR, max_age_days=30),
-        "tts_audio":  ctx.tts_cache.cleanup(),
-    }
-
-
 _SEARCH_INDEX_SAVE_MIN_INTERVAL = 10.0
 _last_search_index_save_at = 0.0
 _search_index_save_lock = threading.Lock()
@@ -948,27 +916,6 @@ class TagPaletteBody(BaseModel):
 @app.put("/api/anno/palette")
 def api_anno_palette(body: TagPaletteBody):
     return {"palette": ctx.anno_store.set_palette(_require_root(), body.tags)}
-
-
-@app.get("/api/health")
-def api_health():
-    return {"ok": True, "app_id": APP_ID, "app_name": APP_NAME,
-            "version": APP_VERSION,
-            "soffice": converter.find_soffice(),
-            "root": str(ctx.root) if _has_root() else None,
-            "needs_root": not _has_root()}
-
-
-@app.get("/api/version")
-def api_version():
-    return {
-        "ok": True,
-        "app_id": APP_ID,
-        "app_name": APP_NAME,
-        "version": APP_VERSION,
-        "release_baseline": RELEASE_BASELINE,
-        "frozen": bool(getattr(sys, "frozen", False)),
-    }
 
 
 @app.get("/api/root")
